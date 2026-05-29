@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-使用 pynput 库实现键盘控制
+Keyboard velocity command publisher for Unitree wholebody control.
 """
 
+import argparse
+import select
+import sys
+import termios
 import time
+import tty
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelFactoryInitialize
 from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
 
@@ -11,7 +16,11 @@ import threading
 import math
 import numpy as np
 import time
-from pynput import keyboard
+
+try:
+    from pynput import keyboard as pynput_keyboard
+except ImportError:
+    pynput_keyboard = None
 
 
 class LowPassFilter:
@@ -30,7 +39,7 @@ class LowPassFilter:
 
 
 class KeyboardController:
-    def __init__(self):
+    def __init__(self, mode="auto"):
         self.control_params = {
             'x_vel': 0.0,
             'y_vel': 0.0,
@@ -59,9 +68,12 @@ class KeyboardController:
             'x': False,  # right rotation
             'c': False,  # crouch
         }
+        self._terminal_key_times = {key: 0.0 for key in self.key_states}
+        self._terminal_key_hold_timeout = 0.25
         
         self.param_lock = threading.Lock()
         self.running = True
+        self.input_mode = self._select_input_mode(mode)
 
         self._filters = {
             'x_vel': LowPassFilter(alpha=0.3),
@@ -85,8 +97,31 @@ class KeyboardController:
         # Start keyboard listener
         self._start_keyboard_listener()
 
+    def _select_input_mode(self, mode):
+        """Select terminal input when possible because it works over SSH/terminal sessions."""
+        if mode == "auto":
+            if sys.stdin.isatty():
+                return "terminal"
+            if pynput_keyboard is not None:
+                return "pynput"
+            raise RuntimeError("stdin is not a TTY and pynput is not installed")
+        if mode == "terminal" and not sys.stdin.isatty():
+            raise RuntimeError("terminal input mode requires an interactive TTY")
+        if mode == "pynput" and pynput_keyboard is None:
+            raise RuntimeError("pynput input mode requested, but pynput is not installed")
+        return mode
+
     def _start_keyboard_listener(self):
-        """start keyboard listener"""
+        """start selected keyboard listener"""
+        if self.input_mode == "terminal":
+            self._start_terminal_listener()
+        elif self.input_mode == "pynput":
+            self._start_pynput_listener()
+        else:
+            raise RuntimeError(f"unsupported keyboard input mode: {self.input_mode}")
+
+    def _start_pynput_listener(self):
+        """start pynput keyboard listener"""
         def on_press(key):
             """key press event"""
             try:
@@ -122,20 +157,71 @@ class KeyboardController:
                 pass
 
         # start keyboard listener
-        self.listener = keyboard.Listener(
+        self.listener = pynput_keyboard.Listener(
             on_press=on_press,
             on_release=on_release
         )
         self.listener.start()
         
-        print("keyboard listener started...")
+        print("keyboard listener started in pynput mode...")
         print("press W/A/S/D/Z/X/C keys to control")
         print("press Q key to exit program")
+
+    def _start_terminal_listener(self):
+        """start terminal raw keyboard listener"""
+        self._terminal_thread = threading.Thread(target=self._terminal_read_loop)
+        self._terminal_thread.daemon = True
+        self._terminal_thread.start()
+
+        print("keyboard listener started in terminal mode...")
+        print("focus this terminal and press W/A/S/D/Z/X/C directly; do not press Enter")
+        print("press Q key to exit program")
+
+    def _terminal_read_loop(self):
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        self._terminal_old_settings = old_settings
+        try:
+            tty.setcbreak(fd)
+            new_settings = termios.tcgetattr(fd)
+            new_settings[3] = new_settings[3] & ~termios.ECHO
+            termios.tcsetattr(fd, termios.TCSADRAIN, new_settings)
+
+            while self.running:
+                readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if not readable:
+                    continue
+                key_char = sys.stdin.read(1).lower()
+                if not key_char:
+                    continue
+
+                with self.param_lock:
+                    if key_char in self.key_states:
+                        if not self.key_states[key_char]:
+                            print(f"[KEY] {key_char.upper()}: press")
+                        self.key_states[key_char] = True
+                        self._terminal_key_times[key_char] = time.monotonic()
+                    elif key_char == 'q':
+                        print("exit program...")
+                        self.running = False
+                        break
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+    def _expire_terminal_keys_locked(self):
+        if self.input_mode != "terminal":
+            return
+        now = time.monotonic()
+        for key_char, last_seen in self._terminal_key_times.items():
+            if self.key_states[key_char] and now - last_seen > self._terminal_key_hold_timeout:
+                self.key_states[key_char] = False
 
     def _control_update(self):
         """control parameter update thread"""
         while self.running:
             with self.param_lock:
+                self._expire_terminal_keys_locked()
+
                 # update control parameters according to key states
                 
                 # forward/backward (x_vel)
@@ -224,6 +310,11 @@ class KeyboardController:
         self.running = False
         if hasattr(self, 'listener'):
             self.listener.stop()
+        if hasattr(self, '_terminal_old_settings') and sys.stdin.isatty():
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self._terminal_old_settings)
+            except termios.error:
+                pass
 
 
 def publish_reset_category(category, publisher):
@@ -237,27 +328,28 @@ def publish_reset_category(category, publisher):
     # print(f"published reset category: {category}")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Publish wholebody run commands from keyboard input.")
+    parser.add_argument(
+        "--mode",
+        choices=["auto", "terminal", "pynput"],
+        default="auto",
+        help="keyboard input mode. auto uses terminal mode when stdin is a TTY.",
+    )
+    args = parser.parse_args()
+
     print("=" * 50)
-    print("keyboard control instructions (pynput version):")
+    print("keyboard control instructions:")
     print("W: forward    S: backward")
     print("A: left  D: right") 
     print("Z: left rotation  X: right rotation")
     print("C: crouch    Q: exit program")
-    print("press and hold the key to increase, release the key to gradually return to the default value")
+    print("terminal mode: press keys directly, no Enter")
+    print("pynput mode: press and hold keys in the active desktop session")
     print("")
-    print("note: if the pynput library is missing, please install:")
-    print("pip install pynput")
+    print("requested input mode:", args.mode)
     print("=" * 50)
     
     try:
-        # check if pynput library is available
-        try:
-            from pynput import keyboard
-        except ImportError:
-            print("error: pynput library missing")
-            print("please install: pip install pynput")
-            exit(1)
-            
         # initialize DDS
         print("initializing DDS communication...")
         ChannelFactoryInitialize(1)
@@ -266,7 +358,7 @@ if __name__ == "__main__":
         print("DDS communication initialized")
         
         print("initializing keyboard controller...")
-        keyboard_controller = KeyboardController()
+        keyboard_controller = KeyboardController(mode=args.mode)
         default_height = 0.8
         
         print("=" * 50)
