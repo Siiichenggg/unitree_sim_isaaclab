@@ -95,6 +95,7 @@ _obs_cache = {
     "vel_buf": None,
     "torque_buf": None,
     "combined_buf": None,
+    "joint_names_signature": None,
     "dds_last_ms": 0,
     "dds_min_interval_ms": 20,
 }
@@ -164,11 +165,23 @@ def get_robot_boy_joint_states(
 
     # 预计算并缓存索引张量（列索引）
     global _obs_cache
-    if _obs_cache["device"] != device or _obs_cache["boy_idx_t"] is None:
-        boy_joint_indices = [0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18, 2, 5, 8, 11, 15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28]
+    joint_names_signature = tuple(env.scene["robot"].data.joint_names)
+    if (
+        _obs_cache["device"] != device
+        or _obs_cache["boy_idx_t"] is None
+        or _obs_cache["joint_names_signature"] != joint_names_signature
+    ):
+        joint_to_index = {name: i for i, name in enumerate(joint_names_signature)}
+        boy_joint_names = get_robot_boy_joint_names()
+        missing = [name for name in boy_joint_names if name not in joint_to_index]
+        if missing:
+            raise RuntimeError(f"G1 robot DDS state publisher missing joints: {missing}")
+        boy_joint_indices = [joint_to_index[name] for name in boy_joint_names]
         _obs_cache["boy_idx_t"] = torch.tensor(boy_joint_indices, dtype=torch.long, device=device)
         _obs_cache["device"] = device
+        _obs_cache["joint_names_signature"] = joint_names_signature
         _obs_cache["batch"] = None  # force re-init batch-shaped buffers
+        print(f"[g1_state] body DDS joint mapping by name: {boy_joint_indices}")
 
     idx_t = _obs_cache["boy_idx_t"]
     n = idx_t.numel()
@@ -211,7 +224,7 @@ def get_robot_boy_joint_states(
             if now_ms - _obs_cache["dds_last_ms"] >= _obs_cache["dds_min_interval_ms"]:
                 g1_robot_dds = _get_g1_robot_dds_instance()
                 if g1_robot_dds:
-                    imu_data = get_robot_imu_data(env)
+                    imu_data = get_robot_imu_data(env, use_torso_imu=False)
                     if imu_data.shape[0] > 0:
                         g1_robot_dds.write_robot_state(
                             pos_buf[0].contiguous().cpu().numpy(),
@@ -310,12 +323,10 @@ def get_robot_imu_data(env, use_torso_imu: bool = True, quat_w_first: bool = Non
     # --- dt ---
     dt = _imu_acc_cache["dt"]
     try:
-        if hasattr(env, "physics_dt"):
-            dt = float(env.physics_dt)
-        elif hasattr(env, "step_dt"):
-            dt = float(env.step_dt)
-        elif hasattr(env, "dt"):
-            dt = float(env.dt)
+        for attr_name in ("_sonic_observation_dt", "step_dt", "dt", "physics_dt"):
+            if hasattr(env, attr_name):
+                dt = float(getattr(env, attr_name))
+                break
     except Exception:
         pass
     if dt <= 0:

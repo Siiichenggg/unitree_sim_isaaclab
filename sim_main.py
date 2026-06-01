@@ -25,8 +25,8 @@ from dds.dds_create import create_dds_objects,create_dds_objects_replay
 # add command line arguments
 parser = argparse.ArgumentParser(description="Unitree Simulation")
 parser.add_argument("--task", type=str, default="Isaac-PickPlace-G129-Head-Waist-Fix", help="task name")
-parser.add_argument("--action_source", type=str, default="dds", 
-                   choices=["dds", "file", "trajectory", "policy", "replay","dds_wholebody"], 
+parser.add_argument("--action_source", type=str, default="dds",
+                   choices=["dds", "file", "trajectory", "policy", "replay", "dds_wholebody", "sonic_dds", "sonic_native"],
                    help="Action source")
 
 
@@ -57,6 +57,29 @@ parser.add_argument("--enable_wholebody_dds", action="store_true", default=False
 parser.add_argument("--physics_dt", type=float, default=None, help="physics time step, e.g., 0.005")
 parser.add_argument("--render_interval", type=int, default=None, help="render interval steps (>=1)")
 parser.add_argument("--camera_write_interval", type=int, default=None, help="camera write interval steps (>=1)")
+parser.add_argument("--sonic_release_ramp_sec", type=float, default=1.0, help="seconds to blend from locked pose to first SONIC targets")
+parser.add_argument("--sonic_release_delay_sec", type=float, default=3.5, help="seconds to keep root locked after the first SONIC LowCmd, allowing SONIC InitControl to finish")
+parser.add_argument("--sonic_state_log_interval_sec", type=float, default=1.0, help="seconds between sonic_dds root stability logs; <=0 disables")
+parser.add_argument("--sonic_root_z", type=float, default=None, help="override root z while sonic_dds is locked before the first LowCmd")
+parser.add_argument("--sonic_torque_control", action="store_true", default=False, help="apply SONIC LowCmd through explicit clipped PD torques instead of Isaac implicit position drives")
+parser.add_argument("--sonic_elastic_band", action="store_true", default=False, help="apply an invisible vertical/upright support wrench like SONIC MuJoCo's elastic band")
+parser.add_argument("--sonic_elastic_band_body", type=str, default="pelvis", help="robot body name to attach the SONIC elastic band to")
+parser.add_argument("--sonic_elastic_band_height", type=float, default=None, help="world z target for the SONIC elastic band; default uses the locked root height")
+parser.add_argument("--sonic_elastic_band_kp", type=float, default=10000.0, help="vertical stiffness for the SONIC elastic band")
+parser.add_argument("--sonic_elastic_band_kd", type=float, default=1000.0, help="vertical damping for the SONIC elastic band")
+parser.add_argument("--sonic_elastic_band_ang_kp", type=float, default=400.0, help="roll/pitch upright stiffness for the SONIC elastic band")
+parser.add_argument("--sonic_elastic_band_ang_kd", type=float, default=20.0, help="angular damping for the SONIC elastic band")
+parser.add_argument("--sonic_elastic_band_max_force", type=float, default=5000.0, help="absolute clamp for SONIC elastic band force components")
+parser.add_argument("--sonic_elastic_band_max_torque", type=float, default=1200.0, help="absolute clamp for SONIC elastic band torque components")
+parser.add_argument("--sonic_motion_state_file", type=str, default="", help="optional JSON file written by SONIC keyboard teleop with current moving/idle state")
+parser.add_argument("--sonic_idle_xy_lock", action="store_true", default=False, help="when keyboard teleop reports idle, apply a planar pelvis station-keeping force")
+parser.add_argument("--sonic_idle_xy_kp", type=float, default=1800.0, help="planar stiffness for SONIC idle XY lock")
+parser.add_argument("--sonic_idle_xy_kd", type=float, default=360.0, help="planar damping for SONIC idle XY lock")
+parser.add_argument("--sonic_idle_xy_max_force", type=float, default=900.0, help="absolute clamp for SONIC idle XY lock force components")
+parser.add_argument("--sonic_idle_xy_deadband", type=float, default=0.015, help="deadband in meters before SONIC idle XY lock applies force")
+parser.add_argument("--sonic_idle_xy_relock_delay_sec", type=float, default=0.75, help="seconds to wait after the last keyboard move command before re-enabling idle XY lock")
+parser.add_argument("--sonic_motion_state_stale_sec", type=float, default=0.75, help="seconds after which keyboard teleop motion state is considered stale")
+parser.add_argument("--sonic_require_motion_started", action="store_true", default=False, help="do not release the root lock until keyboard teleop reports started=true in sonic_motion_state_file")
 
 
 parser.add_argument("--no_render",action="store_true",default=False,help="disable rendering updates entirely (overrides render interval)",)
@@ -73,6 +96,12 @@ parser.add_argument("--camera_jpeg_quality", type=int, default=85, help="JPEG qu
 parser.add_argument("--physx_substeps", type=int, default=None, help="physx substeps per step")
 parser.add_argument("--camera_include", type=str, default="front_camera,left_wrist_camera,right_wrist_camera", help="comma-separated camera names to enable")
 parser.add_argument("--camera_exclude", type=str, default="world_camera", help="comma-separated camera names to disable")
+parser.add_argument("--disable_task_cameras", action="store_true", default=False, help="remove task CameraCfg sensors before env creation; GUI viewport still renders")
+parser.add_argument("--disable_image_server", action="store_true", default=False, help="do not start teleimager image server")
+parser.add_argument("--disable_sim_state_publish", action="store_true", default=False, help="disable rt/sim_state publishing from the main loop")
+parser.add_argument("--sim_state_publish_interval_sec", type=float, default=0.0, help="minimum seconds between rt/sim_state writes; <=0 keeps previous every-loop behavior")
+parser.add_argument("--disable_sim_state_dds", action="store_true", default=False, help="do not create rt/sim_state DDS publisher")
+parser.add_argument("--disable_rewards_dds", action="store_true", default=False, help="do not create rt/rewards_state DDS publisher")
 
 parser.add_argument("--env_reward_interval", type=int, default=5, help="environment reward compute interval (steps)")
 parser.add_argument("--seed", type=int, default=42, help="environment seed")
@@ -114,6 +143,54 @@ from dds.sim_state_dds import *
 from action_provider.create_action_provider import create_action_provider
 from tools.get_stiffness import get_robot_stiffness_from_env
 from tools.get_reward import get_step_reward_value,get_current_rewards
+
+def _split_csv(value):
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+def _camera_cfg_names(scene_cfg):
+    names = []
+    for name in dir(scene_cfg):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(scene_cfg, name)
+        except Exception:
+            continue
+        if value is None:
+            continue
+        class_name = value.__class__.__name__.lower()
+        if "camera" in name.lower() or "camera" in class_name:
+            names.append(name)
+    return sorted(set(names))
+
+
+def prune_task_cameras_before_env_creation(env_cfg, args_cli):
+    """Remove CameraCfg sensors before gym.make so Isaac does not create render products."""
+    scene_cfg = getattr(env_cfg, "scene", None)
+    if scene_cfg is None:
+        return
+
+    camera_names = _camera_cfg_names(scene_cfg)
+    if not camera_names:
+        return
+
+    include = set(_split_csv(args_cli.camera_include))
+    exclude = set(_split_csv(args_cli.camera_exclude))
+    disable_all = bool(args_cli.disable_task_cameras) or (args_cli.camera_include is not None and len(include) == 0)
+
+    disabled = []
+    for name in camera_names:
+        if disable_all or name in exclude or (include and name not in include):
+            try:
+                setattr(scene_cfg, name, None)
+                disabled.append(name)
+            except Exception as exc:
+                print(f"[camera] failed to disable task camera '{name}' before env creation: {exc}")
+
+    if disabled:
+        print(f"[camera] disabled task CameraCfg before env creation: {', '.join(disabled)}")
+
 
 def setup_signal_handlers(controller,dds_manager=None,image_server=None):
     """set signal handlers"""
@@ -170,10 +247,12 @@ def main():
     print(f"Action source: {args_cli.action_source}")
     print("=" * 60)
 
+    image_server = None
     # parse environment configuration
     try:
         env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
         env_cfg.env_name = args_cli.task
+        prune_task_cameras_before_env_creation(env_cfg, args_cli)
     except Exception as e:
         print(f"Failed to parse environment configuration: {e}")
         return
@@ -372,13 +451,16 @@ def main():
     # create controller
 
     if not args_cli.replay_data:
-        print("========= create image server =========")
-        try:
-            image_server = run_isaacsim_server()
-        except Exception as e:
-            print(f"Failed to create image server: {e}")
-            return
-        print("========= create image server success =========")
+        if args_cli.disable_image_server:
+            print("========= image server disabled =========")
+        else:
+            print("========= create image server =========")
+            try:
+                image_server = run_isaacsim_server()
+            except Exception as e:
+                print(f"Failed to create image server: {e}")
+                return
+            print("========= create image server success =========")
         print("========= create dds =========")
         try:
             reset_pose_dds,sim_state_dds,dds_manager = create_dds_objects(args_cli,env)
@@ -407,9 +489,11 @@ def main():
     try:
         print(f"args_cli.task: {args_cli.task}")
         if not args_cli.replay_data and ("Wholebody" in args_cli.task or args_cli.enable_wholebody_dds):
-            args_cli.action_source = "dds_wholebody"
             args_cli.enable_wholebody_dds = True
-            control_config.use_rl_action_mode = True
+            if args_cli.action_source == "dds":
+                args_cli.action_source = "dds_wholebody"
+            if args_cli.action_source in ("dds_wholebody", "sonic_dds", "sonic_native"):
+                control_config.use_rl_action_mode = True
         action_provider = create_action_provider(env,args_cli)
         if action_provider is None:
             print("action provider creation failed, exiting")
@@ -439,7 +523,9 @@ def main():
     else:
         setup_signal_handlers(controller)
         
-    print("Note: The DDS in Sim transmits messages on channel 1. Please ensure that other DDS instances use the same channel for message exchange by setting: ChannelFactoryInitialize(1).")
+    dds_channel = os.getenv("UNITREE_DDS_DOMAIN_ID", os.getenv("UNITREE_DDS_CHANNEL", "0"))
+    dds_interface = os.getenv("UNITREE_DDS_INTERFACE", "lo")
+    print(f"Note: The DDS in Sim transmits messages on channel {dds_channel}. Interface is '{dds_interface}'.")
     try:
         # start controller - start asynchronous components
         print("========= start controller =========")
@@ -451,6 +537,7 @@ def main():
         loop_start_time = time.time()
         loop_count = 0
         last_loop_time = time.time()
+        last_sim_state_publish_time = 0.0
         recent_loop_times = []  # for calculating moving average frequency
         
         
@@ -462,19 +549,25 @@ def main():
                 current_time = time.time()
                 loop_count += 1
                 if not args_cli.replay_data:
-                    try:
-                        env_state = env.scene.get_state()
-                        env_state_json =  sim_state_to_json(env_state)
-                        sim_state = {"init_state":env_state_json,"task_name":args_cli.task}
-                    except Exception as e:
-                        print(f"Failed to get env state: {e}")
-                        raise e
-                    try:
-                    # sim_state = json.dumps(sim_state)
-                        sim_state_dds.write_sim_state_data(sim_state)
-                    except Exception as e:
-                        print(f"Failed to write sim state: {e}")
-                        raise e
+                    publish_sim_state = not args_cli.disable_sim_state_publish
+                    if publish_sim_state and args_cli.sim_state_publish_interval_sec > 0.0:
+                        publish_sim_state = current_time - last_sim_state_publish_time >= args_cli.sim_state_publish_interval_sec
+                    if publish_sim_state:
+                        try:
+                            env_state = env.scene.get_state()
+                            env_state_json =  sim_state_to_json(env_state)
+                            sim_state = {"init_state":env_state_json,"task_name":args_cli.task}
+                        except Exception as e:
+                            print(f"Failed to get env state: {e}")
+                            raise e
+                        if sim_state_dds is not None:
+                            try:
+                            # sim_state = json.dumps(sim_state)
+                                sim_state_dds.write_sim_state_data(sim_state)
+                                last_sim_state_publish_time = current_time
+                            except Exception as e:
+                                print(f"Failed to write sim state: {e}")
+                                raise e
                     try:
                         reset_pose_cmd = reset_pose_dds.get_reset_pose_command()
                     except Exception as e:
@@ -582,7 +675,8 @@ def main():
         # clean up resources
         print("\nclean up resources...")
         controller.cleanup()
-        image_server.stop()
+        if image_server is not None:
+            image_server.stop()
         env.close()
         print("cleanup completed")
     # profiler.disable()
@@ -597,53 +691,6 @@ if __name__ == "__main__":
         main()
     finally:
         print("Performing final cleanup...")
-        
-        # Get current process information
-        import os
-        import subprocess
-        import signal
-        import time
-        
-        current_pid = os.getpid()
-        print(f"Current main process PID: {current_pid}")
-        
-        try:
-            # Find all related Python processes
-            result = subprocess.run(['pgrep', '-f', 'sim_main.py'], 
-                                  capture_output=True, text=True)
-            if result.returncode == 0:
-                pids = result.stdout.strip().split('\n')
-                print(f"Found related processes: {pids}")
-                
-                for pid in pids:
-                    if pid and pid != str(current_pid):
-                        try:
-                            print(f"Terminating child process: {pid}")
-                            os.kill(int(pid), signal.SIGTERM)
-                        except ProcessLookupError:
-                            print(f"Process {pid} does not exist")
-                        except Exception as e:
-                            print(f"Failed to terminate process {pid}: {e}")
-                
-                # Wait for processes to exit
-                time.sleep(2)
-                
-                # Check if there are any remaining processes, force kill them
-                result2 = subprocess.run(['pgrep', '-f', 'sim_main.py'], 
-                                       capture_output=True, text=True)
-                if result2.returncode == 0:
-                    remaining_pids = result2.stdout.strip().split('\n')
-                    for pid in remaining_pids:
-                        if pid and pid != str(current_pid):
-                            try:
-                                print(f"Force killing process: {pid}")
-                                os.kill(int(pid), signal.SIGKILL)
-                            except Exception as e:
-                                print(f"Failed to force kill process {pid}: {e}")
-                                
-        except Exception as e:
-            print(f"Error during process cleanup: {e}")
-        
         try:
             simulation_app.close()
         except Exception as e:

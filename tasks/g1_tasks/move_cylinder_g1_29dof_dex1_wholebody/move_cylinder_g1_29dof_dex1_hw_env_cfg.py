@@ -24,7 +24,11 @@ from tasks.common_config import  G1RobotPresets, CameraPresets  # isort: skip
 from tasks.common_event.event_manager import SimpleEvent, SimpleEventManager
 
 # import public scene configuration
-from tasks.common_scene.base_scene_pickplace_cylindercfg_wholebody import TableCylinderSceneCfgWH
+from tasks.common_scene.base_scene_pickplace_cylindercfg_wholebody import (
+    TableCylinderSceneCfgWH,
+    robot_init_pos,
+    robot_init_rot,
+)
 
 ##
 # Scene definition
@@ -39,8 +43,10 @@ class ObjectTableSceneCfg(TableCylinderSceneCfgWH):
     
     # Humanoid robot w/ arms higher
     # 5. humanoid robot configuration 
-    robot: ArticulationCfg = G1RobotPresets.g1_29dof_dex1_wholebody(init_pos=(-3.9, -2.81811, 0.8),
-        init_rot=(1, 0, 0, 0))
+    robot: ArticulationCfg = G1RobotPresets.g1_29dof_dex1_wholebody(
+        init_pos=robot_init_pos,
+        init_rot=robot_init_rot,
+    )
 
     contact_forces = ContactSensorCfg(prim_path="/World/envs/env_.*/Robot/.*", history_length=10, track_air_time=True, debug_vis=False)
     # 6. add camera configuration 

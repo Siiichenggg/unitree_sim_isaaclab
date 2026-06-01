@@ -82,7 +82,7 @@ class OccupancyGrid:
 class SimPoseSubscriber:
     """Subscribe to ``rt/sim_state`` and expose the latest robot XY-yaw pose."""
 
-    def __init__(self, channel_id: int = 1):
+    def __init__(self, channel_id: int = 0, dds_interface: str = "lo"):
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelSubscriber
         from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
 
@@ -90,7 +90,10 @@ class SimPoseSubscriber:
         self._pose: tuple[float, float, float] | None = None
         self._last_time = 0.0
 
-        ChannelFactoryInitialize(channel_id)
+        if dds_interface:
+            ChannelFactoryInitialize(channel_id, dds_interface)
+        else:
+            ChannelFactoryInitialize(channel_id)
         self._subscriber = ChannelSubscriber("rt/sim_state", String_)
         self._subscriber.Init(lambda msg: self._callback(msg), 1)
 
@@ -116,12 +119,15 @@ class SimPoseSubscriber:
 class RunCommandPublisher:
     """Publish wholebody run commands to ``rt/run_command/cmd``."""
 
-    def __init__(self, channel_id: int = 1):
+    def __init__(self, channel_id: int = 0, dds_interface: str = "lo"):
         from unitree_sdk2py.core.channel import ChannelFactoryInitialize, ChannelPublisher
         from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
 
         self._msg_cls = String_
-        ChannelFactoryInitialize(channel_id)
+        if dds_interface:
+            ChannelFactoryInitialize(channel_id, dds_interface)
+        else:
+            ChannelFactoryInitialize(channel_id)
         self._publisher = ChannelPublisher("rt/run_command/cmd", String_)
         self._publisher.Init()
 
@@ -489,7 +495,7 @@ def follow_path(
             yaw_error = wrap_angle(desired_yaw - yaw)
             yaw_rate = max(-args.max_yaw_rate, min(args.max_yaw_rate, args.yaw_gain * yaw_error))
 
-            if abs(yaw_error) > args.rotate_in_place_angle:
+            if abs(yaw_error) > args.rotate_in_place_angle and not args.allow_strafe:
                 vx, vy = 0.0, 0.0
             else:
                 speed = min(args.max_speed, args.speed_gain * target_dist)
@@ -500,6 +506,8 @@ def follow_path(
                     vy = -math.sin(yaw) * world_vx + math.cos(yaw) * world_vy
                     vx = max(-args.max_speed, min(args.max_speed, vx))
                     vy = max(-args.max_lateral_speed, min(args.max_lateral_speed, vy))
+                    if target_dist > args.waypoint_tolerance and vx > 0.0:
+                        vx = max(args.min_forward_speed, vx)
                 else:
                     vx = max(0.0, speed * math.cos(yaw_error))
                     vy = 0.0
@@ -566,16 +574,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--no-smooth", action="store_true", help="Disable line-of-sight path smoothing.")
     parser.add_argument("--plan-only", action="store_true", help="Only print the A* path; do not use DDS.")
-    parser.add_argument("--channel-id", type=int, default=1, help="DDS ChannelFactoryInitialize id.")
+    parser.add_argument("--channel-id", type=int, default=0, help="DDS ChannelFactoryInitialize id.")
+    parser.add_argument("--dds-interface", type=str, default="lo", help="DDS network interface. Empty string uses SDK default.")
     parser.add_argument("--height", type=float, default=0.8, help="Wholebody policy height command.")
     parser.add_argument("--command-hz", type=float, default=20.0, help="DDS command publish rate.")
     parser.add_argument("--max-speed", type=float, default=0.35, help="Max forward speed command.")
+    parser.add_argument("--min-forward-speed", type=float, default=0.18, help="Minimum forward speed while strafing toward a waypoint.")
     parser.add_argument("--max-lateral-speed", type=float, default=0.20, help="Max lateral speed command when --allow-strafe is set.")
     parser.add_argument("--max-yaw-rate", type=float, default=0.8, help="Max yaw-rate command.")
     parser.add_argument("--speed-gain", type=float, default=0.8, help="Distance-to-speed proportional gain.")
     parser.add_argument("--yaw-gain", type=float, default=1.5, help="Yaw-error proportional gain.")
-    parser.add_argument("--allow-strafe", action="store_true", help="Use lateral velocity instead of mostly turn-then-forward walking.")
-    parser.add_argument("--rotate-in-place-angle", type=float, default=0.55, help="Rotate in place when yaw error is above this value.")
+    parser.set_defaults(allow_strafe=True)
+    parser.add_argument("--allow-strafe", dest="allow_strafe", action="store_true", help="Use lateral velocity and walk while turning.")
+    parser.add_argument("--no-strafe", dest="allow_strafe", action="store_false", help="Use mostly turn-then-forward walking.")
+    parser.add_argument("--rotate-in-place-angle", type=float, default=0.55, help="Rotate in place when yaw error is above this value and --no-strafe is used.")
     parser.add_argument("--waypoint-tolerance", type=float, default=0.25, help="Distance tolerance for intermediate waypoints.")
     parser.add_argument("--goal-tolerance", type=float, default=0.35, help="Distance tolerance for the final goal.")
     parser.add_argument("--feedback-timeout", type=float, default=1.0, help="Max accepted sim_state age in seconds.")
@@ -596,7 +608,7 @@ def main() -> None:
     grid = build_grid(args)
 
     if not args.plan_only:
-        subscriber = SimPoseSubscriber(channel_id=args.channel_id)
+        subscriber = SimPoseSubscriber(channel_id=args.channel_id, dds_interface=args.dds_interface)
         pose = wait_for_pose(subscriber, args.pose_timeout)
         if pose is not None:
             start_xy = (pose[0], pose[1])
@@ -622,7 +634,7 @@ def main() -> None:
 
     if subscriber is None:
         raise RuntimeError("Internal error: subscriber was not created")
-    publisher = RunCommandPublisher(channel_id=args.channel_id)
+    publisher = RunCommandPublisher(channel_id=args.channel_id, dds_interface=args.dds_interface)
     follow_path(path, publisher, subscriber, args)
 
 

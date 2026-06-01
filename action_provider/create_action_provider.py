@@ -4,6 +4,7 @@ from action_provider.action_provider_dds import DDSActionProvider
 from action_provider.action_provider_replay import FileActionProviderReplay
 
 from action_provider.action_provider_wh_dds import DDSRLActionProvider
+from action_provider.action_provider_sonic_dds import SonicDDSActionProvider
 from pathlib import Path
 
 
@@ -19,6 +20,13 @@ def create_action_provider(env,args):
             env=env,
             args_cli=args
         )
+    elif args.action_source == "sonic_dds":
+        return SonicDDSActionProvider(
+            env=env,
+            args_cli=args
+        )
+    elif args.action_source == "sonic_native":
+        raise NotImplementedError("sonic_native is reserved for future Python/ONNX inference; use sonic_dds for the SONIC C++ DDS bridge.")
     elif args.action_source == "replay":
         return FileActionProviderReplay(env=env,args_cli=args)
     else:

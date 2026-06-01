@@ -7,12 +7,63 @@ provides reusable scene element configurations, such as tables, objects, ground,
 import isaaclab.sim as sim_utils
 from isaaclab.assets import  AssetBaseCfg, RigidObjectCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim.spawners.from_files.from_files_cfg import GroundPlaneCfg, UsdFileCfg
+from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from tasks.common_config import   CameraBaseCfg  # isort: skip
 import os
 project_root = os.environ.get("PROJECT_ROOT")
+_room_usd_env = os.environ.get("UNITREE_ROOM_USD")
+_or_scene = os.environ.get("UNITREE_OR_SCENE", "").strip().lower()
+if not _or_scene and _room_usd_env and "pulm" in _room_usd_env.lower():
+    _or_scene = "pulm"
+if _or_scene not in {"halo", "pulm"}:
+    _or_scene = "halo"
+
+_room_usd_defaults = {
+    "halo": f"{project_root}/assets/objects/OR/Model/halo_room_baked/halo_room_baked.usd",
+    "pulm": f"{project_root}/assets/objects/OR/Model/pulm_room_baked/pulm_room_baked.usd",
+}
+_robot_init_pos_defaults = {
+    # OR baked room floors are above world z=0 at the robot spawn points.
+    # Keep the G1's flat-ground root clearance (~0.80 m) relative to the visible room floor.
+    "halo": (1.35, -1.45, 0.91),
+    "pulm": (2.1, -1.2, 0.98),
+}
+
+
+def _float_from_env(name, default):
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        print(f"[scene] invalid {name}={raw!r}, using default {default}")
+        return default
+
+
+def _float_tuple_from_env(name, default, expected_len):
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        values = tuple(float(v.strip()) for v in raw.replace(",", " ").split())
+    except ValueError:
+        print(f"[scene] invalid {name}={raw!r}, using default {default}")
+        return default
+    if len(values) != expected_len:
+        print(f"[scene] invalid {name} length {len(values)}, expected {expected_len}; using default {default}")
+        return default
+    return values
+
+
+room_usd_path = _room_usd_env or _room_usd_defaults[_or_scene]
+robot_init_pos = _float_tuple_from_env("UNITREE_ROBOT_INIT_POS", _robot_init_pos_defaults[_or_scene], 3)
+robot_init_rot = _float_tuple_from_env("UNITREE_ROBOT_INIT_ROT", (0.7071, 0.0, 0.0, 0.7071), 4)
+or_light_pos = _float_tuple_from_env("UNITREE_OR_LIGHT_POS", (robot_init_pos[0], robot_init_pos[1], 2.35), 3)
+or_light_intensity = _float_from_env("UNITREE_OR_LIGHT_INTENSITY", 3500.0)
+or_light_radius = _float_from_env("UNITREE_OR_LIGHT_RADIUS", 1.2)
 @configclass
 class TableCylinderSceneCfgWH(InteractiveSceneCfg): # inherit from the interactive scene configuration class
     """object table scene configuration class
@@ -22,12 +73,10 @@ class TableCylinderSceneCfgWH(InteractiveSceneCfg): # inherit from the interacti
     room_walls = AssetBaseCfg(
         prim_path="/World/envs/env_.*/Room",
         init_state=AssetBaseCfg.InitialStateCfg(
-            pos=[0.0, 0.0, 0],  # room center point
+            pos=[0.0, 0.0, 0.0],  # room center point
             rot=[1.0, 0.0, 0.0, 0.0]
         ),
-        spawn=UsdFileCfg(
-            usd_path=f"{project_root}/assets/objects/small_warehouse/small_warehouse_digital_twin.usd",
-        ),
+        spawn=UsdFileCfg(usd_path=room_usd_path),
     )
 
 
@@ -75,16 +124,21 @@ class TableCylinderSceneCfgWH(InteractiveSceneCfg): # inherit from the interacti
             ),
         ),
     )
+
     # Ground plane
 
 
-    # Lights
-    # 4. light configuration
+    # Lights: keep the OR USD baked textures visible with one lightweight indoor source.
     light = AssetBaseCfg(
-        prim_path="/World/light",   # light in the scene
-        spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), # light color (white)
-                                     intensity=3000.0),    # light intensity
+        prim_path="/World/ORInteriorLight",
+        init_state=AssetBaseCfg.InitialStateCfg(pos=or_light_pos),
+        spawn=sim_utils.SphereLightCfg(
+            color=(1.0, 0.96, 0.90),
+            intensity=or_light_intensity,
+            radius=or_light_radius,
+        ),
     )
     world_camera = CameraBaseCfg.get_camera_config(prim_path="/World/PerspectiveCamera",
-                                                    pos_offset=(-1.9, -5.0, 1.8),
-                                                    rot_offset=( -0.40614,0.78544, 0.4277, -0.16986))
+                                                    pos_offset=(-0.1, 3.6, 1.6),
+                                                    rot_offset=(-0.00617, 0.00617, 0.70708, -0.70708),
+                                                    focal_length=16.5)

@@ -31,6 +31,7 @@ class DDSRLActionProvider(ActionProvider):
         self.dex3_dds = None
         self.inspire_dds = None
         self.run_command = None
+        self._last_run_command_log = 0.0
         self._setup_dds()
         self._setup_joint_mapping()
         self.policy = self.load_policy(self.policy_path)
@@ -334,9 +335,14 @@ class DDSRLActionProvider(ActionProvider):
                     command[3] = float(run_command_data[3])
                 except (IndexError, TypeError) as e:
                     print(f"[WARNING] cannot parse run_command data: {run_command_data}, error: {e}")
-            
-            self.run_command_dds.write_run_command([0.0,0,0,0.8])
-      
+            now = time.monotonic()
+            if (
+                any(abs(value) > 1e-3 for value in command[:3])
+                and now - self._last_run_command_log > 1.0
+            ):
+                print(f"[{self.name}] run_command={command}", flush=True)
+                self._last_run_command_log = now
+
         # command = [0.5,0.0,0.7,0.8]
         command = torch.tensor(command, device=self.env.device, dtype=torch.float32)
         

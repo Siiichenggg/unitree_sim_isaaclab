@@ -37,6 +37,9 @@ _camera_cache = {
     'last_scene_id': None,
     'frame_step': 0,
     'write_interval_steps': 2,
+    'no_camera_reported': False,
+    'fallback_camera_reported': False,
+    'allowlist': None,
 }
 
 
@@ -64,6 +67,29 @@ def _ensure_async_started():
         _async_started = True
 
 
+def set_camera_allowlist(camera_names):
+    if camera_names:
+        _camera_cache['allowlist'] = set(camera_names)
+    else:
+        _camera_cache['allowlist'] = None
+
+
+def _copy_camera_image(env: ManagerBasedRLEnv, camera_name: str):
+    camera_image = env.scene[camera_name].data.output["rgb"][0]
+    if camera_image.device.type == 'cpu':
+        return camera_image.numpy()
+    return camera_image.cpu().numpy()
+
+
+def _add_named_camera_image(env: ManagerBasedRLEnv, images: dict, camera_keys: list, scene_name: str, output_name: str):
+    if scene_name not in camera_keys:
+        return
+    allowlist = _camera_cache.get('allowlist')
+    if allowlist and scene_name not in allowlist:
+        return
+    images[output_name] = _copy_camera_image(env, scene_name)
+
+
 def get_camera_image(
     env: ManagerBasedRLEnv,
 ) -> dict:
@@ -89,6 +115,14 @@ def get_camera_image(
         _camera_cache['camera_keys'] = list(env.scene.keys())
         _camera_cache['available_cameras'] = [name for name in _camera_cache['camera_keys'] if "camera" in name.lower()]
         _camera_cache['last_scene_id'] = scene_id
+        _camera_cache['no_camera_reported'] = False
+        _camera_cache['fallback_camera_reported'] = False
+
+    if not _camera_cache['available_cameras']:
+        if not _camera_cache['no_camera_reported']:
+            print("[camera_state] No camera images found in the environment")
+            _camera_cache['no_camera_reported'] = True
+        return _return_placeholder
 
 
     if _camera_cache['frame_step'] == 0:
@@ -110,36 +144,26 @@ def get_camera_image(
 
     camera_keys = _camera_cache['camera_keys']
     # Head camera (front camera)
-    if "front_camera" in camera_keys:
-        head_image = env.scene["front_camera"].data.output["rgb"][0]  # [batch, height, width, 3]
-
-        if head_image.device.type == 'cpu':
-            images["head"] = head_image.numpy()
-        else:
-            images["head"] = head_image.cpu().numpy()
+    _add_named_camera_image(env, images, camera_keys, "front_camera", "head")
+    _add_named_camera_image(env, images, camera_keys, "front_camera_up", "head_up")
+    _add_named_camera_image(env, images, camera_keys, "front_camera_down", "head_down")
+    _add_named_camera_image(env, images, camera_keys, "front_camera_left", "head_left")
+    _add_named_camera_image(env, images, camera_keys, "front_camera_right", "head_right")
     
     # Left camera (left wrist camera)
-    if "left_wrist_camera" in camera_keys:
-        left_image = env.scene["left_wrist_camera"].data.output["rgb"][0]
-        if left_image.device.type == 'cpu':
-            images["left"] = left_image.numpy()
-        else:
-            images["left"] = left_image.cpu().numpy()
+    _add_named_camera_image(env, images, camera_keys, "left_wrist_camera", "left")
     
     # Right camera (right wrist camera)  
-    if "right_wrist_camera" in camera_keys:
-        right_image = env.scene["right_wrist_camera"].data.output["rgb"][0]
-        if right_image.device.type == 'cpu':
-            images["right"] = right_image.numpy()
-        else:
-            images["right"] = right_image.cpu().numpy()
+    _add_named_camera_image(env, images, camera_keys, "right_wrist_camera", "right")
     
     # if no camera with the specified name is found, try other common camera names
     if not images:
 
         available_cameras = _camera_cache['available_cameras']
         if available_cameras:
-            print(f"[camera_state] No standard cameras found. Available cameras: {available_cameras}")
+            if not _camera_cache['fallback_camera_reported']:
+                print(f"[camera_state] No standard cameras found. Available cameras: {available_cameras}")
+                _camera_cache['fallback_camera_reported'] = True
             
             # if there are available cameras, use the first three as head, left, right
             for i, camera_name in enumerate(available_cameras[:3]):
@@ -169,7 +193,8 @@ def get_camera_image(
         except Exception:
             pass
     elif not images:
-        print("[camera_state] No camera images found in the environment")
+        if not _camera_cache['no_camera_reported']:
+            print("[camera_state] No camera images found in the environment")
+            _camera_cache['no_camera_reported'] = True
     
     return _return_placeholder
-

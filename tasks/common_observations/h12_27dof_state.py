@@ -314,12 +314,10 @@ def get_robot_imu_data(env, use_torso_imu: bool = True, quat_w_first: bool = Non
     # --- dt ---
     dt = _imu_acc_cache["dt"]
     try:
-        if hasattr(env, "physics_dt"):
-            dt = float(env.physics_dt)
-        elif hasattr(env, "step_dt"):
-            dt = float(env.step_dt)
-        elif hasattr(env, "dt"):
-            dt = float(env.dt)
+        for attr_name in ("_sonic_observation_dt", "step_dt", "dt", "physics_dt"):
+            if hasattr(env, attr_name):
+                dt = float(getattr(env, attr_name))
+                break
     except Exception:
         pass
     if dt <= 0:

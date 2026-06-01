@@ -2,6 +2,7 @@
 # License: Apache License, Version 2.0
 import time
 import threading
+import os
 from typing import Dict, List, Optional
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 from dds.dds_base import DDSObject
@@ -57,9 +58,19 @@ class DDSManager:
             return True
         
         try:
-            ChannelFactoryInitialize(1)
+            dds_interface = os.getenv("UNITREE_DDS_INTERFACE", "lo").strip()
+            dds_domain = int(os.getenv("UNITREE_DDS_DOMAIN_ID", os.getenv("UNITREE_DDS_CHANNEL", "0")))
+            if dds_interface:
+                try:
+                    ChannelFactoryInitialize(dds_domain, dds_interface)
+                    print(f"[DDSManager] DDS system initialized on channel {dds_domain} interface '{dds_interface}'")
+                except TypeError:
+                    ChannelFactoryInitialize(dds_domain)
+                    print(f"[DDSManager] DDS system initialized on channel {dds_domain}")
+            else:
+                ChannelFactoryInitialize(dds_domain)
+                print(f"[DDSManager] DDS system initialized on channel {dds_domain}")
             self.dds_initialized = True
-            print("[DDSManager] DDS system initialized")
             return True
         except Exception as e:
             print(f"[DDSManager] DDS system initialization failed: {e}")

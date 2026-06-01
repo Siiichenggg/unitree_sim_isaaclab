@@ -6,12 +6,14 @@ Handle the state publishing and command receiving of the G1 robot
 """
 
 import numpy as np
+import time
+import os
 from typing import Any, Dict, Optional
 # from dds.dds_base import BaseDDSNode, node_manager
 from dds.dds_base import DDSObject
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_, LowCmd_
-from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_, unitree_hg_msg_dds__LowState_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import IMUState_, LowState_, LowCmd_
+from unitree_sdk2py.idl.default import unitree_hg_msg_dds__IMUState_, unitree_hg_msg_dds__LowState_
 from unitree_sdk2py.utils.crc import CRC
 
 
@@ -33,14 +35,24 @@ class G1RobotDDS(DDSObject):
         self.node_name = node_name
         self.crc = CRC()
         self.low_state = unitree_hg_msg_dds__LowState_()
+        self.imu_torso_state = unitree_hg_msg_dds__IMUState_()
         self._initialized = True
+        self._last_cmd_log = 0.0
+        shm_suffix = os.getenv("UNITREE_SHM_SUFFIX", "").strip()
+        if shm_suffix:
+            safe_suffix = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in shm_suffix)
+            input_shm_name = f"isaac_robot_state_{safe_suffix}"
+            output_shm_name = f"dds_robot_cmd_{safe_suffix}"
+        else:
+            input_shm_name = "isaac_robot_state"
+            output_shm_name = "dds_robot_cmd"
         
         # setup the shared memory
         self.setup_shared_memory(
-            input_shm_name="isaac_robot_state",  # read the state of the G1 robot from Isaac Lab
-            output_shm_name="dds_robot_cmd",  # output the command to Isaac Lab
-            input_size=3072,
-            output_size=3072  # output the command to Isaac Lab
+            input_shm_name=input_shm_name,  # read the state of the G1 robot from Isaac Lab
+            output_shm_name=output_shm_name,  # output the command to Isaac Lab
+            input_size=8192,
+            output_size=16384  # output the command to Isaac Lab
         )
         
         print(f"[{self.node_name}] G1 robot DDS node initialized")
@@ -50,7 +62,9 @@ class G1RobotDDS(DDSObject):
         try:
             self.publisher = ChannelPublisher("rt/lowstate", LowState_)
             self.publisher.Init()
-            print(f"[{self.node_name}] State publisher initialized (rt/lowstate)")
+            self.imu_torso_publisher = ChannelPublisher("rt/secondary_imu", IMUState_)
+            self.imu_torso_publisher.Init()
+            print(f"[{self.node_name}] State publisher initialized (rt/lowstate, rt/secondary_imu)")
             return True
         except Exception as e:
             print(f"g1_robot_dds [{self.node_name}] State publisher initialization failed: {e}")    
@@ -97,16 +111,17 @@ class G1RobotDDS(DDSObject):
             imu = data.get("imu_data")
             if imu and len(imu) >= 13:
                 imu_array = np.asarray(imu, dtype=np.float32)
-
-                imu_state.quaternion[:] = imu_array[[4, 5, 6, 3]] #[x,y,z,w]
-
+                imu_state.quaternion[:] = imu_array[3:7]
                 imu_state.accelerometer[:] = imu_array[7:10]
-
                 imu_state.gyroscope[:] = imu_array[10:13]
+                self.imu_torso_state.quaternion[:] = imu_array[3:7]
+                self.imu_torso_state.accelerometer[:] = imu_array[7:10]
+                self.imu_torso_state.gyroscope[:] = imu_array[10:13]
 
             self.low_state.tick += 1
             self.low_state.crc = self.crc.Crc(self.low_state)
             self.publisher.Write(self.low_state)
+            self.imu_torso_publisher.Write(self.imu_torso_state)
 
         except Exception as e:
             print(f"g1_robot_dds [{self.node_name}] Error processing publish data: {e}")
@@ -139,6 +154,7 @@ class G1RobotDDS(DDSObject):
             cmd_data = {
                 "mode_pr": int(msg.mode_pr),
                 "mode_machine": int(msg.mode_machine),
+                "_receive_time": time.perf_counter(),
                 "motor_cmd": {
                     "positions": [float(msg.motor_cmd[i].q) for i in range(num_cmd_motors)],
                     "velocities": [float(msg.motor_cmd[i].dq) for i in range(num_cmd_motors)],
@@ -147,6 +163,12 @@ class G1RobotDDS(DDSObject):
                     "kd": [float(msg.motor_cmd[i].kd) for i in range(num_cmd_motors)]
                 }
             }
+            now = time.monotonic()
+            arm_positions = cmd_data["motor_cmd"]["positions"][15:29]
+            if any(abs(position) > 1e-4 for position in arm_positions) and now - self._last_cmd_log > 1.0:
+                rounded = [round(position, 3) for position in arm_positions]
+                print(f"[{self.node_name}] received arm cmd positions={rounded}", flush=True)
+                self._last_cmd_log = now
             self.output_shm.write_data(cmd_data)
             
         except Exception as e:

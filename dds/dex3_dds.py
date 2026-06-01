@@ -6,6 +6,7 @@ Handle the state publishing and command receiving of the hand (left and right)
 """
 
 import threading
+import time
 from typing import Any, Dict, Optional, Tuple
 from dds.dds_base import DDSObject
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
@@ -41,6 +42,7 @@ class Dex3DDS(DDSObject):
         self.right_cmd_subscriber = None
         
         self._initialized = True
+        self._last_cmd_log = 0.0
         self.existing_data = {"left_hand_cmd": {}, "right_hand_cmd": {}}
         # setup shared memory
         self.setup_shared_memory(
@@ -96,6 +98,12 @@ class Dex3DDS(DDSObject):
             # process the command of the hand and write to the shared memory
             cmd_data = self.process_hand_command(msg, datatype)
             if cmd_data and self.output_shm:
+                now = time.monotonic()
+                positions = cmd_data.get("positions", [])
+                if any(abs(position) > 1e-4 for position in positions) and now - self._last_cmd_log > 1.0:
+                    rounded = [round(position, 3) for position in positions]
+                    print(f"[{self.node_name}] received {datatype} hand cmd positions={rounded}", flush=True)
+                    self._last_cmd_log = now
                 # write to shared memory
                 self.existing_data[f"{datatype}_hand_cmd"] = cmd_data
                 self.output_shm.write_data(self.existing_data)

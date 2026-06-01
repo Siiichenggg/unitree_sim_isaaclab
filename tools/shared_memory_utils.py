@@ -10,7 +10,7 @@ import ctypes
 import time
 import numpy as np
 import cv2
-from multiprocessing import shared_memory
+from multiprocessing import resource_tracker, shared_memory
 from typing import Optional, Dict, List
 import struct
 import os
@@ -26,6 +26,21 @@ SHM_SIZE_PER_IMAGE = 640 * 480 * 3 + 128  # ~1MB per image + header + buffer
 # Backward compatibility
 SHM_NAME = "isaac_multi_image_shm"  # Kept for backward compatibility
 SHM_SIZE = SHM_SIZE_PER_IMAGE * 3   # Kept for backward compatibility
+
+
+def attach_existing_shared_memory(name: str) -> shared_memory.SharedMemory:
+    """Attach to an existing SHM segment without owning its lifetime.
+
+    Python's resource_tracker may unlink shared memory on reader process exit.
+    Readers should only close their handle; the simulator writer owns creation
+    and cleanup.
+    """
+    shm = shared_memory.SharedMemory(name=name)
+    try:
+        resource_tracker.unregister(shm._name, "shared_memory")
+    except Exception:
+        pass
+    return shm
 
 # define the simplified header structure
 class SimpleImageHeader(ctypes.LittleEndianStructure):  # Use little-endian for cross-platform compatibility
@@ -78,7 +93,7 @@ class MultiImageWriter:
         """Write multiple images to separate shared memories
 
         Args:
-            images: the image dictionary, the key is the image name ('head', 'left', 'right'), the value is the image array
+            images: the image dictionary, keyed by camera name (for example 'head', 'head_left', 'left')
 
         Returns:
             bool: whether the writing is successful
@@ -100,7 +115,7 @@ class MultiImageWriter:
                 if shm_name not in self.shms:
                     try:
                         # 尝试打开现有的共享内存
-                        self.shms[shm_name] = shared_memory.SharedMemory(name=shm_name)
+                        self.shms[shm_name] = attach_existing_shared_memory(shm_name)
                     except FileNotFoundError:
                         # 如果不存在，创建新的共享内存
                         self.shms[shm_name] = shared_memory.SharedMemory(create=True, size=SHM_SIZE_PER_IMAGE, name=shm_name)
@@ -195,7 +210,7 @@ class MultiImageReader:
             Dict[str, np.ndarray]: the image dictionary, the key is the image name, the value is the image array
         """
         images = {}
-        image_names = ['head', 'left', 'right']  # Standard image names
+        image_names = ['head', 'head_left', 'head_right', 'head_up', 'head_down', 'left', 'right']  # Standard image names
 
         for image_name in image_names:
             try:
@@ -204,7 +219,7 @@ class MultiImageReader:
                 # Open shared memory if not already open
                 if shm_name not in self.shms:
                     try:
-                        self.shms[shm_name] = shared_memory.SharedMemory(name=shm_name)
+                        self.shms[shm_name] = attach_existing_shared_memory(shm_name)
                     except FileNotFoundError:
                         continue  # Skip if shared memory doesn't exist
 
@@ -264,8 +279,8 @@ class MultiImageReader:
             return None
 
         try:
-            # Concatenate images in order: head, left, right
-            image_order = ['head', 'left', 'right']
+            # Concatenate images in a stable diagnostic order.
+            image_order = ['head', 'head_left', 'head_right', 'head_up', 'head_down', 'left', 'right']
             frames_to_concat = []
 
             for image_name in image_order:
@@ -290,7 +305,7 @@ class MultiImageReader:
         """Read a single specific image from its dedicated shared memory.
 
         Args:
-            image_name: Name of the image to read ("head", "left", or "right")
+            image_name: Name of the image to read, for example "head", "head_left", or "right"
 
         Returns:
             np.ndarray: The requested image array, or None if not found or error
@@ -301,7 +316,7 @@ class MultiImageReader:
             # Open shared memory if not already open
             if shm_name not in self.shms:
                 try:
-                    self.shms[shm_name] = shared_memory.SharedMemory(name=shm_name)
+                        self.shms[shm_name] = attach_existing_shared_memory(shm_name)
                 except FileNotFoundError:
                     print(f"[MultiImageReader] Shared memory {shm_name} not found")
                     return None

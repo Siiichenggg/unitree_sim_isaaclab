@@ -48,7 +48,14 @@ def _get_gripper_dds_instance():
             # dynamically import the DDS module
             sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'dds'))
             from dds.dds_master import dds_manager
-            
+
+            if "dex1" not in getattr(dds_manager, "objects", {}):
+                if not _dds_initialized:
+                    print("[gripper_state] dex1 DDS is not registered; gripper DDS publishing is disabled until available")
+                _dds_initialized = True
+                _gripper_dds = None
+                return None
+
             _gripper_dds = dds_manager.get_object("dex1")
             print("[Observations] DDS communication instance obtained")
             
@@ -157,4 +164,3 @@ def get_robot_gipper_joint_states(
             print(f"[gripper_state] Failed to write to shared memory: {e}")
     
     return pos_buf
-

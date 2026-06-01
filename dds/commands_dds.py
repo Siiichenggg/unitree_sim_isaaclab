@@ -5,7 +5,9 @@ Run command DDS communication class
 Specialized in receiving the run command
 """
 
+import os
 import threading
+import time
 from typing import Any, Dict, Optional
 from dds.dds_base import DDSObject
 from unitree_sdk2py.core.channel import ChannelSubscriber
@@ -24,6 +26,7 @@ class RunCommandDDS(DDSObject):
         
         self._initialized = True
         self.node_name = node_name
+        self.command_timeout_s = float(os.environ.get("UNITREE_RUN_COMMAND_TIMEOUT", "0.75"))
         # setup the shared memory
         self.setup_shared_memory(
             output_shm_name="isaac_run_command_cmd", 
@@ -61,7 +64,8 @@ class RunCommandDDS(DDSObject):
         """Process the subscribe data"""
         try:
             cmd_data = {
-                "run_command": msg.data
+                "run_command": msg.data,
+                "received_at": time.monotonic(),
             }
             self.output_shm.write_data(cmd_data)
         except Exception as e:
@@ -75,7 +79,17 @@ class RunCommandDDS(DDSObject):
             Dict: the run command, if no command return None
         """
         if self.output_shm:
-            return self.output_shm.read_data()
+            data = self.output_shm.read_data()
+            if not data:
+                return None
+            received_at = data.get("received_at")
+            if isinstance(received_at, (int, float)) and time.monotonic() - received_at > self.command_timeout_s:
+                return {"run_command": [0.0, 0.0, 0.0, 0.8], "stale": True}
+            if not isinstance(received_at, (int, float)):
+                written_at = data.get("_timestamp")
+                if not isinstance(written_at, (int, float)) or time.time() - written_at > self.command_timeout_s:
+                    return {"run_command": [0.0, 0.0, 0.0, 0.8], "stale": True}
+            return data
         return None
     
     def write_run_command(self, flag_category):
@@ -87,7 +101,8 @@ class RunCommandDDS(DDSObject):
         try:
             # prepare the reset pose data
             cmd_data = {
-                "run_command":flag_category
+                "run_command":flag_category,
+                "received_at": time.monotonic(),
             }
             
             # write the reset pose data to the shared memory
