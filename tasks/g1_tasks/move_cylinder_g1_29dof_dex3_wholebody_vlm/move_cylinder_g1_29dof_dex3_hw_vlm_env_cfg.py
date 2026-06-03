@@ -4,40 +4,32 @@
 import math
 import os
 
-import isaaclab.sim as sim_utils
-from isaaclab.assets import AssetBaseCfg
+import torch
+import isaaclab.envs.mdp as base_mdp
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import ContactSensorCfg
+from isaaclab.sim.spawners.from_files.from_files_cfg import UsdFileCfg
 from isaaclab.utils import configclass
 
-from tasks.common_config import CameraBaseCfg
-from tasks.common_scene.base_scene_pickplace_cylindercfg_wholebody import robot_init_pos
+from tasks.common_config import CameraBaseCfg, CameraPresets, G1RobotPresets
+from tasks.common_event.event_manager import SimpleEvent, SimpleEventManager
 from tasks.g1_tasks.move_cylinder_g1_29dof_dex3_wholebody.move_cylinder_g1_29dof_dex3_hw_env_cfg import (
     MoveCylinderG129Dex3WholebodyEnvCfg,
-    ObjectTableSceneCfg,
 )
 
 
-def _float_from_env(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        print(f"[vlm-lighting] invalid {name}={raw!r}, using default {default}")
-        return default
-
-
-def _float_tuple_from_env(name: str, default: tuple[float, float, float]) -> tuple[float, float, float]:
+def _float_tuple_from_env(name: str, default: tuple[float, ...]) -> tuple[float, ...]:
     raw = os.environ.get(name)
     if not raw:
         return default
     try:
         values = tuple(float(v.strip()) for v in raw.replace(",", " ").split())
     except ValueError:
-        print(f"[vlm-lighting] invalid {name}={raw!r}, using default {default}")
+        print(f"[vlm-scene] invalid {name}={raw!r}, using default {default}")
         return default
-    if len(values) != 3:
-        print(f"[vlm-lighting] invalid {name} length {len(values)}, expected 3; using default {default}")
+    if len(values) != len(default):
+        print(f"[vlm-scene] invalid {name} length {len(values)}, expected {len(default)}; using default {default}")
         return default
     return values
 
@@ -76,36 +68,61 @@ def _head_camera_yaw(name: str, yaw_deg: float):
     )
 
 
-vlm_ambient_intensity = _float_from_env("UNITREE_VLM_AMBIENT_INTENSITY", 800.0)
-vlm_robot_fill_pos = _float_tuple_from_env(
-    "UNITREE_VLM_ROBOT_FILL_POS",
-    (robot_init_pos[0], robot_init_pos[1], robot_init_pos[2] + 0.75),
-)
-vlm_robot_fill_intensity = _float_from_env("UNITREE_VLM_ROBOT_FILL_INTENSITY", 0.0)
-vlm_robot_fill_radius = _float_from_env("UNITREE_VLM_ROBOT_FILL_RADIUS", 1.8)
+project_root = os.environ.get("PROJECT_ROOT") or os.getcwd()
+_room_usd_env = os.environ.get("UNITREE_ROOM_USD")
+_or_scene = os.environ.get("UNITREE_OR_SCENE", "").strip().lower()
+if not _or_scene and _room_usd_env and "pulm" in _room_usd_env.lower():
+    _or_scene = "pulm"
+if _or_scene not in {"halo", "pulm"}:
+    _or_scene = "halo"
+
+_room_usd_defaults = {
+    "halo": f"{project_root}/assets/objects/OR/Model/halo_room_baked/halo_room_baked.usd",
+    "pulm": f"{project_root}/assets/objects/OR/Model/pulm_room_baked/pulm_room_baked.usd",
+}
+_robot_init_pos_defaults = {
+    "halo": (1.35, -1.45, 0.91),
+    "pulm": (2.1, -1.2, 0.98),
+}
+
+room_usd_path = _room_usd_env or _room_usd_defaults[_or_scene]
+robot_init_pos = _float_tuple_from_env("UNITREE_ROBOT_INIT_POS", _robot_init_pos_defaults[_or_scene])
+robot_init_rot = _float_tuple_from_env("UNITREE_ROBOT_INIT_ROT", (0.7071, 0.0, 0.0, 0.7071))
 
 
 @configclass
-class VLMObjectTableSceneCfg(ObjectTableSceneCfg):
-    """Dex3 wholebody scene with extra fixed head-camera views for VLM search."""
+class VLMORSceneCfg(InteractiveSceneCfg):
+    """OR-only Dex3 wholebody scene for VLM search.
 
-    vlm_ambient_light = AssetBaseCfg(
-        prim_path="/World/VLMAmbientFillLight",
-        spawn=sim_utils.DomeLightCfg(
-            color=(0.92, 0.96, 1.0),
-            intensity=vlm_ambient_intensity,
-            visible_in_primary_ray=False,
+    This scene intentionally does not inherit the base move-cylinder scene,
+    because that base scene brings packing-table assets and task lights that
+    are already represented by the self-contained OR room USD.
+    """
+
+    room = AssetBaseCfg(
+        prim_path="/World/envs/env_.*/Room",
+        init_state=AssetBaseCfg.InitialStateCfg(
+            pos=[0.0, 0.0, 0.0],
+            rot=[1.0, 0.0, 0.0, 0.0],
         ),
+        spawn=UsdFileCfg(usd_path=room_usd_path),
     )
-    vlm_robot_fill_light = AssetBaseCfg(
-        prim_path="/World/VLMRobotFillLight",
-        init_state=AssetBaseCfg.InitialStateCfg(pos=vlm_robot_fill_pos),
-        spawn=sim_utils.SphereLightCfg(
-            color=(1.0, 0.97, 0.92),
-            intensity=vlm_robot_fill_intensity,
-            radius=vlm_robot_fill_radius,
-        ),
+
+    robot: ArticulationCfg = G1RobotPresets.g1_29dof_dex3_wholebody(
+        init_pos=robot_init_pos,
+        init_rot=robot_init_rot,
     )
+    contact_forces = ContactSensorCfg(
+        prim_path="/World/envs/env_.*/Robot/.*",
+        history_length=10,
+        track_air_time=True,
+        debug_vis=False,
+    )
+
+    front_camera = CameraPresets.g1_front_camera()
+    left_wrist_camera = CameraPresets.left_dex3_wrist_camera()
+    right_wrist_camera = CameraPresets.right_dex3_wrist_camera()
+    robot_camera = CameraPresets.g1_world_camera()
     front_camera_up = _head_camera_pitch("front_cam_up", pitch_deg=20.0)
     front_camera_down = _head_camera_pitch("front_cam_down", pitch_deg=-20.0)
     front_camera_left = _head_camera_yaw("front_cam_left", yaw_deg=-25.0)
@@ -114,10 +131,36 @@ class VLMObjectTableSceneCfg(ObjectTableSceneCfg):
 
 @configclass
 class MoveCylinderG129Dex3WholebodyVLMEnvCfg(MoveCylinderG129Dex3WholebodyEnvCfg):
-    """VLM-specific Dex3 wholebody task that leaves the base Dex3 task unchanged."""
+    """VLM-specific Dex3 wholebody task using an OR-only scene."""
 
-    scene: VLMObjectTableSceneCfg = VLMObjectTableSceneCfg(
+    scene: VLMORSceneCfg = VLMORSceneCfg(
         num_envs=1,
         env_spacing=2.5,
         replicate_physics=True,
     )
+    rewards = None
+
+    def __post_init__(self):
+        """Post initialization without object-specific reset/reward dependencies."""
+        self.decimation = 4
+        self.episode_length_s = 20.0
+        self.sim.dt = 0.005
+        self.scene.contact_forces.update_period = self.sim.dt
+        self.sim.render_interval = self.decimation
+        self.sim.physx.bounce_threshold_velocity = 0.01
+        self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
+        self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024
+        self.sim.physx.friction_correlation_distance = 0.00625
+
+        self.sim.physics_material.static_friction = 1.0
+        self.sim.physics_material.dynamic_friction = 1.0
+        self.sim.physics_material.friction_combine_mode = "max"
+        self.sim.physics_material.restitution_combine_mode = "max"
+
+        self.event_manager = SimpleEventManager()
+
+        def reset_all(env):
+            base_mdp.reset_scene_to_default(env, torch.arange(env.num_envs, device=env.device))
+
+        self.event_manager.register("reset_all_self", SimpleEvent(func=reset_all))
+        self.event_manager.register("reset_object_self", SimpleEvent(func=reset_all))

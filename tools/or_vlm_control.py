@@ -20,6 +20,7 @@ PID_FILE = STATE_DIR / "sim.pid"
 META_FILE = STATE_DIR / "sim.json"
 SIM_LOG = LOG_DIR / "sim.log"
 VISUAL_SERVO = PROJECT_ROOT / "tools" / "visual_vlm_servo.py"
+WASD_TELEOP = PROJECT_ROOT / "tools" / "wasd_walk_teleop.py"
 SIM_MAIN = PROJECT_ROOT / "sim_main.py"
 OR_SCENES = {
     "halo": PROJECT_ROOT / "assets" / "objects" / "OR" / "Model" / "halo_room_baked" / "halo_room_baked.usd",
@@ -288,6 +289,23 @@ def execute_vlm_instruction(instruction: str) -> int:
     return subprocess.call(command, cwd=PROJECT_ROOT)
 
 
+def execute_wasd_teleop() -> int:
+    pid = read_pid()
+    if pid is None or not is_pid_alive(pid):
+        print("[or-vlm] simulator is not running; start it first if you want the robot to respond")
+
+    command = [
+        detect_sim_python(),
+        str(WASD_TELEOP),
+        "--channel-id",
+        str(DDS_CHANNEL),
+        "--dds-interface",
+        DDS_INTERFACE,
+    ]
+    print("[or-vlm] WASD teleop mode", flush=True)
+    return subprocess.call(command, cwd=PROJECT_ROOT)
+
+
 def menu() -> int:
     print("[or-vlm] OR VLM navigation menu")
     try:
@@ -295,6 +313,7 @@ def menu() -> int:
             print()
             print("1) Start simulator")
             print("2) Execute VLM instruction")
+            print("3) WASD walk")
             print("q) Quit")
             choice = input("select> ").strip().lower()
 
@@ -310,6 +329,8 @@ def menu() -> int:
                     start_simulator(scene)
             elif choice == "2":
                 execute_vlm_instruction(input("visual instruction> "))
+            elif choice == "3":
+                execute_wasd_teleop()
             else:
                 print("[or-vlm] unknown selection")
     except (EOFError, KeyboardInterrupt):

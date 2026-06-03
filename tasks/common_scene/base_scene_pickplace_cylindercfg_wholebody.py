@@ -62,7 +62,7 @@ room_usd_path = _room_usd_env or _room_usd_defaults[_or_scene]
 robot_init_pos = _float_tuple_from_env("UNITREE_ROBOT_INIT_POS", _robot_init_pos_defaults[_or_scene], 3)
 robot_init_rot = _float_tuple_from_env("UNITREE_ROBOT_INIT_ROT", (0.7071, 0.0, 0.0, 0.7071), 4)
 or_light_pos = _float_tuple_from_env("UNITREE_OR_LIGHT_POS", (robot_init_pos[0], robot_init_pos[1], 2.35), 3)
-or_light_intensity = _float_from_env("UNITREE_OR_LIGHT_INTENSITY", 3500.0)
+or_light_intensity = _float_from_env("UNITREE_OR_LIGHT_INTENSITY", 0.0)
 or_light_radius = _float_from_env("UNITREE_OR_LIGHT_RADIUS", 1.2)
 @configclass
 class TableCylinderSceneCfgWH(InteractiveSceneCfg): # inherit from the interactive scene configuration class
