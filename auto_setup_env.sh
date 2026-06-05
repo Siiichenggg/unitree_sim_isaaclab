@@ -2,7 +2,7 @@
 set -e 
 
 # 0. Directory safety check
-if [ ! -d "teleimager" ] || [ ! -f "requirements.txt" ]; then
+if [ ! -f "requirements.txt" ] || [ ! -f ".gitmodules" ]; then
     echo "Error: Please place and run this script from the root of the unitree_sim_isaaclab project!"
     exit 1
 fi
@@ -15,6 +15,8 @@ if [ "$#" -lt 2 ]; then
 fi
 
 sudo apt-get update && sudo apt-get install -y cmake build-essential openssl git-lfs unzip
+
+git submodule update --init --recursive teleimager
 
 ISAAC_VERSION=$1
 ENV_NAME=$2

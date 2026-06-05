@@ -17,7 +17,7 @@ _TASK_MODULES = [
         "pick_place_cylinder_g1_29dof_inspire",
         "move_cylinder_g1_29dof_dex1_wholebody",
         "move_cylinder_g1_29dof_dex3_wholebody",
-        "move_cylinder_g1_29dof_dex3_wholebody_vlm",
+        "or_vlm_g1_29dof_dex3_wholebody",
         "move_cylinder_g1_29dof_inspire_wholebody",
         "sonic_flat_ground_g1_29dof",
         "or_halo_room_g1_29dof_dex1",

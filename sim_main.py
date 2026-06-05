@@ -17,6 +17,11 @@ import torch
 import gymnasium as gym
 from pathlib import Path
 
+DEFAULT_CAMERA_INCLUDE = (
+    "front_camera,left_wrist_camera,right_wrist_camera,"
+    + ",".join(f"scene_camera_{index:02d}" for index in range(11))
+)
+
 # Isaac Lab AppLauncher
 from isaaclab.app import AppLauncher
 
@@ -80,6 +85,12 @@ parser.add_argument("--sonic_idle_xy_deadband", type=float, default=0.015, help=
 parser.add_argument("--sonic_idle_xy_relock_delay_sec", type=float, default=0.75, help="seconds to wait after the last keyboard move command before re-enabling idle XY lock")
 parser.add_argument("--sonic_motion_state_stale_sec", type=float, default=0.75, help="seconds after which keyboard teleop motion state is considered stale")
 parser.add_argument("--sonic_require_motion_started", action="store_true", default=False, help="do not release the root lock until keyboard teleop reports started=true in sonic_motion_state_file")
+parser.add_argument(
+    "--wholebody_action_substeps",
+    type=int,
+    default=int(os.environ.get("UNITREE_WHOLEBODY_ACTION_SUBSTEPS", "4")),
+    help="physics substeps advanced per wholebody DDS action-provider update",
+)
 
 
 parser.add_argument("--no_render",action="store_true",default=False,help="disable rendering updates entirely (overrides render interval)",)
@@ -92,9 +103,15 @@ parser.add_argument("--skip_cvtcolor", action="store_true", default=False, help=
 
 parser.add_argument("--camera_jpeg", action="store_true", default=True, help="enable JPEG compression for camera frames")
 parser.add_argument("--camera_jpeg_quality", type=int, default=85, help="JPEG quality (1-100)")
+parser.add_argument(
+    "--camera_transport",
+    type=str,
+    default=os.environ.get("UNITREE_CAMERA_TRANSPORT", "shm"),
+    help="camera image transport: shm, dds, or dds,shm",
+)
 
 parser.add_argument("--physx_substeps", type=int, default=None, help="physx substeps per step")
-parser.add_argument("--camera_include", type=str, default="front_camera,left_wrist_camera,right_wrist_camera", help="comma-separated camera names to enable")
+parser.add_argument("--camera_include", type=str, default=DEFAULT_CAMERA_INCLUDE, help="comma-separated camera names to enable")
 parser.add_argument("--camera_exclude", type=str, default="world_camera", help="comma-separated camera names to disable")
 parser.add_argument("--disable_task_cameras", action="store_true", default=False, help="remove task CameraCfg sensors before env creation; GUI viewport still renders")
 parser.add_argument("--disable_image_server", action="store_true", default=False, help="do not start teleimager image server")
@@ -102,6 +119,9 @@ parser.add_argument("--disable_sim_state_publish", action="store_true", default=
 parser.add_argument("--sim_state_publish_interval_sec", type=float, default=0.0, help="minimum seconds between rt/sim_state writes; <=0 keeps previous every-loop behavior")
 parser.add_argument("--disable_sim_state_dds", action="store_true", default=False, help="do not create rt/sim_state DDS publisher")
 parser.add_argument("--disable_rewards_dds", action="store_true", default=False, help="do not create rt/rewards_state DDS publisher")
+parser.add_argument("--frame_viewer_on_robot", action="store_true", default=False, help="point the GUI viewport camera at the robot after reset")
+parser.add_argument("--show_robot_debug_marker", action="store_true", default=False, help="add a visible red marker above the robot root for GUI debugging")
+parser.add_argument("--robot_debug_interval_sec", type=float, default=0.0, help="print robot root pose periodically; <=0 disables")
 
 parser.add_argument("--env_reward_interval", type=int, default=5, help="environment reward compute interval (steps)")
 parser.add_argument("--seed", type=int, default=42, help="environment seed")
@@ -137,6 +157,88 @@ from tools.augmentation_utils import (
     update_light,
     batch_augment_cameras_by_name,
 )
+
+
+def _round_tuple(values, digits=3):
+    return tuple(round(float(value), digits) for value in values)
+
+
+def debug_robot_stage(env, show_marker: bool = False) -> None:
+    """Print robot stage diagnostics and optionally add a visible marker."""
+    try:
+        from pxr import Gf, UsdGeom
+        stage = env.sim.stage
+        robot_prim_path = "/World/envs/env_0/Robot"
+        room_prim_path = "/World/envs/env_0/Room"
+        floor_prim_path = "/World/envs/env_0/ORFloorCollider"
+        robot_prim = stage.GetPrimAtPath(robot_prim_path)
+        room_prim = stage.GetPrimAtPath(room_prim_path)
+        floor_prim = stage.GetPrimAtPath(floor_prim_path)
+        robot = env.scene["robot"]
+        root_pos = robot.data.root_pos_w[0].detach().cpu().tolist()
+        root_quat = robot.data.root_quat_w[0].detach().cpu().tolist()
+        print(f"[robot-debug] scene_entities={list(env.scene.keys())}", flush=True)
+        print(f"[robot-debug] root_pos={_round_tuple(root_pos)} root_quat={_round_tuple(root_quat)}", flush=True)
+        print(
+            f"[robot-debug] prim={robot_prim_path} "
+            f"valid={robot_prim.IsValid()} active={robot_prim.IsActive() if robot_prim else None} "
+            f"type={robot_prim.GetTypeName() if robot_prim else None}",
+            flush=True,
+        )
+        print(
+            f"[robot-debug] room={room_prim_path} "
+            f"valid={room_prim.IsValid()} active={room_prim.IsActive() if room_prim else None} "
+            f"type={room_prim.GetTypeName() if room_prim else None}",
+            flush=True,
+        )
+        print(
+            f"[robot-debug] floor={floor_prim_path} "
+            f"valid={floor_prim.IsValid()} active={floor_prim.IsActive() if floor_prim else None} "
+            f"type={floor_prim.GetTypeName() if floor_prim else None}",
+            flush=True,
+        )
+
+        if show_marker:
+            marker_path = "/World/envs/env_0/RobotDebugMarker"
+            marker = UsdGeom.Sphere.Define(stage, marker_path)
+            marker.CreateRadiusAttr().Set(0.18)
+            marker.CreateDisplayColorAttr().Set([Gf.Vec3f(1.0, 0.0, 0.0)])
+            marker.CreateDisplayOpacityAttr().Set([1.0])
+            xform = UsdGeom.Xformable(marker.GetPrim())
+            xform.ClearXformOpOrder()
+            marker_pos = (float(root_pos[0]), float(root_pos[1]), float(root_pos[2] + 1.25))
+            xform.AddTranslateOp().Set(Gf.Vec3d(*marker_pos))
+            UsdGeom.Imageable(marker.GetPrim()).CreatePurposeAttr().Set(UsdGeom.Tokens.render)
+            print(f"[robot-debug] marker={marker_path} pos={_round_tuple(marker_pos)}", flush=True)
+    except Exception as e:
+        print(f"[robot-debug] failed: {e}", flush=True)
+
+
+def frame_viewer_on_robot(env) -> None:
+    """Move the GUI viewport camera inside the room and point it at the robot."""
+    try:
+        if getattr(args_cli, "headless", False) or args_cli.no_render:
+            return
+        robot = env.scene["robot"]
+        root_pos = robot.data.root_pos_w[0].detach().cpu().tolist()
+        target = (
+            float(root_pos[0]),
+            float(root_pos[1]),
+            float(root_pos[2] + 0.45),
+        )
+        eye = (
+            float(root_pos[0] - 1.15),
+            float(root_pos[1] - 1.15),
+            float(root_pos[2] + 0.95),
+        )
+        try:
+            from isaacsim.core.utils.viewports import set_camera_view
+        except Exception:
+            from omni.isaac.core.utils.viewports import set_camera_view
+        set_camera_view(eye=eye, target=target)
+        print(f"[viewer] framed robot viewport eye={tuple(round(v, 3) for v in eye)} target={tuple(round(v, 3) for v in target)}")
+    except Exception as e:
+        print(f"[viewer] failed to frame robot viewport: {e}")
 
 from tools.data_json_load import sim_state_to_json
 from dds.sim_state_dds import *
@@ -342,6 +444,7 @@ def main():
             os.environ["CAMERA_SKIP_CVTCOLOR"] = "1"
         try:
             import tasks.common_observations.camera_state as cam_state
+            os.environ["UNITREE_CAMERA_TRANSPORT"] = str(args_cli.camera_transport)
             enable_jpeg = bool(args_cli.camera_jpeg) or (os.getenv("CAMERA_JPEG") == "1")
             jpeg_quality = int(args_cli.camera_jpeg_quality if args_cli.camera_jpeg else os.getenv("CAMERA_JPEG_QUALITY", args_cli.camera_jpeg_quality))
             cam_state.set_writer_options(enable_jpeg=enable_jpeg, jpeg_quality=jpeg_quality, skip_cvtcolor=args_cli.skip_cvtcolor)
@@ -437,6 +540,10 @@ def main():
         )
     env.sim.reset()
     env.reset()
+    if args_cli.frame_viewer_on_robot or args_cli.show_robot_debug_marker:
+        debug_robot_stage(env, show_marker=args_cli.show_robot_debug_marker)
+    if args_cli.frame_viewer_on_robot:
+        frame_viewer_on_robot(env)
     
     # create simplified control configuration
     try:    
@@ -538,6 +645,7 @@ def main():
         loop_count = 0
         last_loop_time = time.time()
         last_sim_state_publish_time = 0.0
+        last_robot_debug_time = 0.0
         recent_loop_times = []  # for calculating moving average frequency
         
         
@@ -548,6 +656,20 @@ def main():
             while simulation_app.is_running() and controller.is_running:
                 current_time = time.time()
                 loop_count += 1
+                if args_cli.robot_debug_interval_sec > 0.0 and current_time - last_robot_debug_time >= args_cli.robot_debug_interval_sec:
+                    try:
+                        robot = env.scene["robot"]
+                        root_pos = robot.data.root_pos_w[0].detach().cpu().tolist()
+                        root_lin_vel = robot.data.root_lin_vel_w[0].detach().cpu().tolist()
+                        print(
+                            f"[robot-debug] step={loop_count} "
+                            f"root_pos={_round_tuple(root_pos)} "
+                            f"root_lin_vel={_round_tuple(root_lin_vel)}",
+                            flush=True,
+                        )
+                        last_robot_debug_time = current_time
+                    except Exception as e:
+                        print(f"[robot-debug] periodic failed: {e}", flush=True)
                 if not args_cli.replay_data:
                     publish_sim_state = not args_cli.disable_sim_state_publish
                     if publish_sim_state and args_cli.sim_state_publish_interval_sec > 0.0:

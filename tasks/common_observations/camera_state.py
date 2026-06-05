@@ -42,6 +42,8 @@ _camera_cache = {
     'allowlist': None,
 }
 
+ROOM_SCENE_CAMERA_COUNT = 11
+
 
 _return_placeholder = None
 _async_queue = None
@@ -145,10 +147,10 @@ def get_camera_image(
     camera_keys = _camera_cache['camera_keys']
     # Head camera (front camera)
     _add_named_camera_image(env, images, camera_keys, "front_camera", "head")
-    _add_named_camera_image(env, images, camera_keys, "front_camera_up", "head_up")
-    _add_named_camera_image(env, images, camera_keys, "front_camera_down", "head_down")
-    _add_named_camera_image(env, images, camera_keys, "front_camera_left", "head_left")
-    _add_named_camera_image(env, images, camera_keys, "front_camera_right", "head_right")
+
+    # Fixed OR room cameras imported from the source Blender scene.
+    for index in range(ROOM_SCENE_CAMERA_COUNT):
+        _add_named_camera_image(env, images, camera_keys, f"scene_camera_{index:02d}", f"scene_{index:02d}")
     
     # Left camera (left wrist camera)
     _add_named_camera_image(env, images, camera_keys, "left_wrist_camera", "left")

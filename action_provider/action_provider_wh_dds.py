@@ -25,13 +25,18 @@ class DDSRLActionProvider(ActionProvider):
         self.wh = args_cli.enable_wholebody_dds
         self.policy_path = f"{project_root}/"+args_cli.model_path
         self.env = env
+        self.wholebody_action_substeps = max(1, int(getattr(args_cli, "wholebody_action_substeps", 4)))
+        print(f"[{self.name}] wholebody_action_substeps={self.wholebody_action_substeps}", flush=True)
         # Initialize DDS communication
         self.robot_dds = None
         self.gripper_dds = None
         self.dex3_dds = None
         self.inspire_dds = None
+        self.run_command_dds = None
         self.run_command = None
         self._last_run_command_log = 0.0
+        self._last_idle_hold_log = 0.0
+        self.run_command_epsilon = float(os.environ.get("UNITREE_RUN_COMMAND_EPSILON", "0.001"))
         self._setup_dds()
         self._setup_joint_mapping()
         self.policy = self.load_policy(self.policy_path)
@@ -78,6 +83,19 @@ class DDSRLActionProvider(ActionProvider):
             self._right_hand_buf = torch.empty(len(self._right_hand_source_indices), device=device, dtype=torch.float32)
         if self.enable_inspire:
             self._inspire_buf = torch.empty(12, device=device, dtype=torch.float32)
+        self.robot = self.env.scene["robot"]
+        self.idle_root_lock_enabled = os.environ.get("UNITREE_IDLE_ROOT_LOCK", "1").strip().lower() not in {"0", "false", "no"}
+        self.idle_allow_upper_body_dds = os.environ.get("UNITREE_IDLE_ALLOW_UPPER_BODY_DDS", "0").strip().lower() in {"1", "true", "yes"}
+        self.post_motion_zero_policy = os.environ.get("UNITREE_POST_MOTION_ZERO_POLICY", "1").strip().lower() not in {"0", "false", "no"}
+        self.idle_root_lock_pose = None
+        self.zero_root_velocity = None
+        self.idle_hold_joint_positions = self.default_action_positions.clone()
+        self.idle_hold_joint_velocities = torch.zeros_like(self.default_action_velocities)
+        self._last_command_active = False
+        self._has_locomotion_command = False
+        self._post_motion_idle_active = False
+        self._last_idle_lock_log = 0.0
+        self._capture_idle_hold_state("startup")
         
     def _setup_dds(self):
         """Setup DDS communication"""
@@ -311,37 +329,96 @@ class DDSRLActionProvider(ActionProvider):
             ort_outs = model.run(None, ort_inputs)
             return torch.tensor(ort_outs[0], device=self.env.device)
         return run_inference
-    def compute_current_observations(self):
-        command = [0,0,0,0.8]  
-        run_command = self.run_command_dds.get_run_command()
+    def _coerce_run_command(self, run_command_data):
+        command = [0.0, 0.0, 0.0, 0.8]
+        if isinstance(run_command_data, str):
+            try:
+                run_command_data = ast.literal_eval(run_command_data)
+            except (ValueError, SyntaxError) as e:
+                print(f"[WARNING] cannot parse run_command string: {run_command_data}, error: {e}")
+                return None
+        try:
+            if len(run_command_data) < 4:
+                print(f"[WARNING] run_command too short: {run_command_data}")
+                return None
+            command[0] = float(run_command_data[0])
+            command[1] = float(run_command_data[1])
+            command[2] = float(run_command_data[2])
+            command[3] = float(run_command_data[3])
+            return command
+        except (IndexError, TypeError, ValueError) as e:
+            print(f"[WARNING] cannot parse run_command data: {run_command_data}, error: {e}")
+            return None
+
+    def _read_run_command(self):
+        command = [0.0, 0.0, 0.0, 0.8]
+        stale = True
+        run_command = None
+        if self.run_command_dds:
+            try:
+                run_command = self.run_command_dds.get_run_command()
+            except Exception as e:
+                print(f"[WARNING] cannot read run_command: {e}")
         if run_command and 'run_command' in run_command:
-            run_command_data = run_command['run_command']
-            
-            if isinstance(run_command_data, str):
-                try:
-                    run_command_list = ast.literal_eval(run_command_data)
-                    if isinstance(run_command_list, list) and len(run_command_list) >= 4:
-                        command[0] = float(run_command_list[0])
-                        command[1] = float(run_command_list[1])
-                        command[2] = float(run_command_list[2])
-                        command[3] = float(run_command_list[3])
-                except (ValueError, SyntaxError) as e:
-                    print(f"[WARNING] cannot parse run_command string: {run_command_data}, error: {e}")
+            stale = bool(run_command.get("stale", False))
+            parsed_command = self._coerce_run_command(run_command["run_command"])
+            if parsed_command is None:
+                stale = True
             else:
-                try:
-                    command[0] = float(run_command_data[0])
-                    command[1] = float(run_command_data[1])
-                    command[2] = float(run_command_data[2])
-                    command[3] = float(run_command_data[3])
-                except (IndexError, TypeError) as e:
-                    print(f"[WARNING] cannot parse run_command data: {run_command_data}, error: {e}")
-            now = time.monotonic()
-            if (
-                any(abs(value) > 1e-3 for value in command[:3])
-                and now - self._last_run_command_log > 1.0
-            ):
-                print(f"[{self.name}] run_command={command}", flush=True)
-                self._last_run_command_log = now
+                command = parsed_command
+
+        if stale:
+            command = [0.0, 0.0, 0.0, 0.8]
+
+        command_active = (not stale) and any(abs(value) > self.run_command_epsilon for value in command[:3])
+        now = time.monotonic()
+        if command_active and now - self._last_run_command_log > 1.0:
+            print(f"[{self.name}] run_command={command}", flush=True)
+            self._last_run_command_log = now
+        elif not command_active and now - self._last_idle_hold_log > 5.0:
+            reason = "stale" if stale else "zero"
+            print(f"[{self.name}] idle_hold reason={reason} command={command}", flush=True)
+            self._last_idle_hold_log = now
+        return command, command_active, stale
+
+    def _reset_policy_delay_buffer(self):
+        self.action_buffer.reset()
+        self.action_buffer.compute(
+            torch.zeros(self.num_envs, self.num_actions_all, dtype=torch.float, device=self.env.device, requires_grad=False)
+        )
+
+    def _capture_idle_hold_state(self, reason):
+        if self.idle_root_lock_enabled:
+            root_state = getattr(self.robot.data, "root_state_w", None)
+            if root_state is not None and root_state.numel() > 0:
+                self.idle_root_lock_pose = root_state[:, :7].clone().to(device=self.env.device, dtype=torch.float32)
+                self.zero_root_velocity = torch.zeros(
+                    (self.idle_root_lock_pose.shape[0], 6),
+                    device=self.env.device,
+                    dtype=torch.float32,
+                )
+        self.idle_hold_joint_positions = self.robot.data.joint_pos.clone().to(device=self.env.device, dtype=torch.float32)
+        self.idle_hold_joint_velocities = torch.zeros_like(self.robot.data.joint_vel, device=self.env.device)
+        now = time.monotonic()
+        if now - self._last_idle_lock_log > 2.0:
+            if self.idle_root_lock_pose is not None:
+                pose = self.idle_root_lock_pose[0]
+                print(
+                    f"[{self.name}] idle_root_lock reason={reason} "
+                    f"root=({pose[0].item():.3f}, {pose[1].item():.3f}, {pose[2].item():.3f})",
+                    flush=True,
+                )
+            else:
+                print(f"[{self.name}] idle_root_lock reason={reason} root=unavailable", flush=True)
+            self._last_idle_lock_log = now
+
+    def _apply_idle_hold_state(self):
+        if self.idle_root_lock_enabled and self.idle_root_lock_pose is not None and self.zero_root_velocity is not None:
+            self.robot.write_root_pose_to_sim(self.idle_root_lock_pose)
+            self.robot.write_root_velocity_to_sim(self.zero_root_velocity)
+        self.robot.write_joint_state_to_sim(self.idle_hold_joint_positions, self.idle_hold_joint_velocities)
+
+    def compute_current_observations(self, command):
 
         # command = [0.5,0.0,0.7,0.8]
         command = torch.tensor(command, device=self.env.device, dtype=torch.float32)
@@ -365,90 +442,142 @@ class DDSRLActionProvider(ActionProvider):
         dim=-1,
     )
         return current_actor_obs
-    def compute_observations(self):
+    def compute_observations(self, command):
 
-        current_actor_obs = self.compute_current_observations()
+        current_actor_obs = self.compute_current_observations(command)
 
         self.actor_obs_buffer.append(current_actor_obs)
         actor_obs = self.actor_obs_buffer.buffer.reshape(self.num_envs, -1)
         actor_obs = torch.clip(actor_obs, -self.clip_obs, self.clip_obs)
         return actor_obs
     
-    def run_policy(self):
-        current_actor_obs = self.compute_observations()
+    def run_policy(self, command):
+        current_actor_obs = self.compute_observations(command)
         action = self.policy(current_actor_obs)
         return action
+
+    def _apply_robot_command(self, full_action):
+        if self.enable_robot == "g129" and self.robot_dds:
+            cmd_data = self.robot_dds.get_robot_command()
+            if cmd_data and 'motor_cmd' in cmd_data:
+                positions = cmd_data['motor_cmd']['positions']
+                if len(positions) >= 29 and hasattr(self, "_arm_source_idx_t"):
+                    self._positions_buf[:29].copy_(torch.tensor(positions[:29], dtype=torch.float32, device=self.env.device))
+                    arm_vals = self._positions_buf.index_select(0, self._arm_source_idx_t)
+                    full_action.index_copy_(0, self._arm_target_idx_t, arm_vals)
+
+    def _apply_hand_command(self, full_action):
+        if self.gripper_dds and hasattr(self, "_gripper_source_idx_t"):
+            gripper_cmd = self.gripper_dds.get_gripper_command()
+            if gripper_cmd:
+                left_gripper_cmd = gripper_cmd.get('left_gripper_cmd', {})
+                right_gripper_cmd = gripper_cmd.get('right_gripper_cmd', {})
+                left_gripper_positions = left_gripper_cmd.get('positions', [])
+                right_gripper_positions = right_gripper_cmd.get('positions', [])
+                gripper_positions = right_gripper_positions + left_gripper_positions
+                if len(gripper_positions) >= 2:
+                    self._gripper_buf.copy_(torch.tensor(gripper_positions[:2], dtype=torch.float32, device=self.env.device))
+                    gp_vals = self._gripper_buf.index_select(0, self._gripper_source_idx_t)
+                    full_action.index_copy_(0, self._gripper_target_idx_t, gp_vals)
+        elif self.dex3_dds and hasattr(self, "_left_hand_source_idx_t"):
+            hand_cmds = self.dex3_dds.get_hand_commands()
+            if hand_cmds:
+                left_hand_cmd = hand_cmds.get('left_hand_cmd', {})
+                right_hand_cmd = hand_cmds.get('right_hand_cmd', {})
+                if left_hand_cmd and right_hand_cmd:
+                    left_positions = left_hand_cmd.get('positions', [])
+                    right_positions = right_hand_cmd.get('positions', [])
+                    if len(left_positions) >= len(self._left_hand_buf) and len(right_positions) >= len(self._right_hand_buf):
+                        self._left_hand_buf.copy_(torch.tensor(left_positions[:len(self._left_hand_buf)], dtype=torch.float32, device=self.env.device))
+                        self._right_hand_buf.copy_(torch.tensor(right_positions[:len(self._right_hand_buf)], dtype=torch.float32, device=self.env.device))
+                        l_vals = self._left_hand_buf.index_select(0, self._left_hand_source_idx_t)
+                        r_vals = self._right_hand_buf.index_select(0, self._right_hand_source_idx_t)
+                        full_action.index_copy_(0, self._left_hand_target_idx_t, l_vals)
+                        full_action.index_copy_(0, self._right_hand_target_idx_t, r_vals)
+        elif self.inspire_dds and hasattr(self, "_inspire_source_idx_t"):
+            inspire_cmds = self.inspire_dds.get_inspire_hand_command()
+            if inspire_cmds and 'positions' in inspire_cmds:
+                    inspire_cmds_positions = inspire_cmds['positions']
+                    if len(inspire_cmds_positions) >= 12:
+                        self._inspire_buf.copy_(torch.tensor(inspire_cmds_positions[:12], dtype=torch.float32, device=self.env.device))
+                        base_vals = self._inspire_buf.index_select(0, self._inspire_source_idx_t)
+                        full_action.index_copy_(0, self._inspire_target_idx_t, base_vals)
+                        special_vals = self._inspire_buf.index_select(0, self._inspire_special_source_idx_t) * self._inspire_special_scales_t
+                        full_action.index_copy_(0, self._inspire_special_target_idx_t, special_vals)
+
     def get_action(self, env) -> Optional[torch.Tensor]:
         """Get action from DDS"""
         try:
             full_action = self._full_action_buf
             full_action.zero_()
-            action_data = self.run_policy()
+            command, command_active, _ = self._read_run_command()
 
-            # RL 输出与腰部默认位姿
-            full_action[self.action_to_indices] = action_data
-            full_action[self.waist_to_all_indices] = self.default_waist_positions
-            # 机器人指令（若有）
-            if self.enable_robot == "g129" and self.robot_dds:
-                cmd_data = self.robot_dds.get_robot_command()
-                if cmd_data and 'motor_cmd' in cmd_data:
-                    positions = cmd_data['motor_cmd']['positions']
-                    if len(positions) >= 29 and hasattr(self, "_arm_source_idx_t"):
-                        self._positions_buf[:29].copy_(torch.tensor(positions[:29], dtype=torch.float32, device=self.env.device))
-                        arm_vals = self._positions_buf.index_select(0, self._arm_source_idx_t)
-                        full_action.index_copy_(0, self._arm_target_idx_t, arm_vals)
-            # 延时/裁剪/缩放
-            delayed_actions = self.action_buffer.compute(full_action[self.old_action_indices].unsqueeze(0))
-            cliped_actions = torch.clip(delayed_actions[:,self.action_to_indices], -self.clip_actions, self.clip_actions).to(self.env.device)
-            full_action[self.action_to_indices] = cliped_actions * self.action_scale + self.default_action_positions[:, self.action_to_indices]
-            
+            if command_active and not self._last_command_active:
+                self._has_locomotion_command = True
+                self._post_motion_idle_active = False
+                print(f"[{self.name}] locomotion command active; releasing idle root lock", flush=True)
+            elif not command_active and self._last_command_active:
+                if self.post_motion_zero_policy:
+                    self._post_motion_idle_active = True
+                    print(
+                        f"[{self.name}] post-motion zero-velocity policy active; idle root lock deferred",
+                        flush=True,
+                    )
+                else:
+                    self._capture_idle_hold_state("command_stop")
+                    self._reset_policy_delay_buffer()
+            elif not command_active and self.idle_root_lock_pose is None:
+                self._capture_idle_hold_state("idle")
+            self._last_command_active = command_active
+            post_motion_idle = (
+                not command_active
+                and self.post_motion_zero_policy
+                and (self._has_locomotion_command or self._post_motion_idle_active)
+            )
+            policy_active = command_active or post_motion_idle
+            policy_command = command if command_active else [0.0, 0.0, 0.0, 0.8]
+
+            if policy_active:
+                action_data = self.run_policy(policy_command).reshape(-1)
+                if action_data.numel() < len(self.action_to_indices):
+                    raise ValueError(f"policy output too short: {action_data.numel()} < {len(self.action_to_indices)}")
+
+                # RL 输出与腰部默认位姿
+                full_action[self.action_to_indices] = action_data[:len(self.action_to_indices)]
+                full_action[self.waist_to_all_indices] = self.default_waist_positions.squeeze(0)
+                if command_active:
+                    self._apply_robot_command(full_action)
+
+                # 延时/裁剪/缩放
+                delayed_actions = self.action_buffer.compute(full_action[self.old_action_indices].unsqueeze(0))
+                cliped_actions = torch.clip(delayed_actions[:, self.action_to_indices], -self.clip_actions, self.clip_actions).to(self.env.device)
+                full_action[self.action_to_indices] = (
+                    cliped_actions.squeeze(0) * self.action_scale
+                    + self.default_action_positions[0, self.action_to_indices]
+                )
+            else:
+                full_action.copy_(self.idle_hold_joint_positions.squeeze(0))
+                if self.idle_allow_upper_body_dds:
+                    self._apply_robot_command(full_action)
+
             # 夹爪/手指（若有）
-            if self.gripper_dds and hasattr(self, "_gripper_source_idx_t"):
-                gripper_cmd = self.gripper_dds.get_gripper_command()
-                if gripper_cmd:
-                    left_gripper_cmd = gripper_cmd.get('left_gripper_cmd', {})
-                    right_gripper_cmd = gripper_cmd.get('right_gripper_cmd', {})
-                    left_gripper_positions = left_gripper_cmd.get('positions', [])
-                    right_gripper_positions = right_gripper_cmd.get('positions', [])
-                    gripper_positions = right_gripper_positions + left_gripper_positions
-                    if len(gripper_positions) >= 2:
-                        self._gripper_buf.copy_(torch.tensor(gripper_positions[:2], dtype=torch.float32, device=self.env.device))
-                        gp_vals = self._gripper_buf.index_select(0, self._gripper_source_idx_t)
-                        full_action.index_copy_(0, self._gripper_target_idx_t, gp_vals)
-            elif self.dex3_dds and hasattr(self, "_left_hand_source_idx_t"):
-                hand_cmds = self.dex3_dds.get_hand_commands()
-                if hand_cmds:
-                    left_hand_cmd = hand_cmds.get('left_hand_cmd', {})
-                    right_hand_cmd = hand_cmds.get('right_hand_cmd', {})
-                    if left_hand_cmd and right_hand_cmd:
-                        left_positions = left_hand_cmd.get('positions', [])
-                        right_positions = right_hand_cmd.get('positions', [])
-                        if len(left_positions) >= len(self._left_hand_buf) and len(right_positions) >= len(self._right_hand_buf):
-                            self._left_hand_buf.copy_(torch.tensor(left_positions[:len(self._left_hand_buf)], dtype=torch.float32, device=self.env.device))
-                            self._right_hand_buf.copy_(torch.tensor(right_positions[:len(self._right_hand_buf)], dtype=torch.float32, device=self.env.device))
-                            l_vals = self._left_hand_buf.index_select(0, self._left_hand_source_idx_t)
-                            r_vals = self._right_hand_buf.index_select(0, self._right_hand_source_idx_t)
-                            full_action.index_copy_(0, self._left_hand_target_idx_t, l_vals)
-                            full_action.index_copy_(0, self._right_hand_target_idx_t, r_vals)
-            elif self.inspire_dds and hasattr(self, "_inspire_source_idx_t"):
-                inspire_cmds = self.inspire_dds.get_inspire_hand_command()
-                if inspire_cmds and 'positions' in inspire_cmds:
-                        inspire_cmds_positions = inspire_cmds['positions']
-                        if len(inspire_cmds_positions) >= 12:
-                            self._inspire_buf.copy_(torch.tensor(inspire_cmds_positions[:12], dtype=torch.float32, device=self.env.device))
-                            base_vals = self._inspire_buf.index_select(0, self._inspire_source_idx_t)
-                            full_action.index_copy_(0, self._inspire_target_idx_t, base_vals)
-                            special_vals = self._inspire_buf.index_select(0, self._inspire_special_source_idx_t) * self._inspire_special_scales_t
-                            full_action.index_copy_(0, self._inspire_special_target_idx_t, special_vals)
+            if command_active or self.idle_allow_upper_body_dds:
+                self._apply_hand_command(full_action)
+
             # 同步仿真多步
-            for _ in range(4):
+            for _ in range(self.wholebody_action_substeps):
+                if not policy_active:
+                    self._apply_idle_hold_state()
                 self.env.scene["robot"].set_joint_position_target(full_action) 
                 self.env.scene.write_data_to_sim()                           
                 self.env.sim.step(render=False)                              
-                self.env.scene.update(dt=self.env.physics_dt)                    
+                self.env.scene.update(dt=self.env.physics_dt)
+                if not policy_active:
+                    self._apply_idle_hold_state()
 
             self.env.sim.render()
             self.env.observation_manager.compute()
+            return full_action.unsqueeze(0)
             
         except Exception as e:
             print(f"[{self.name}] Get DDS action failed: {e}")

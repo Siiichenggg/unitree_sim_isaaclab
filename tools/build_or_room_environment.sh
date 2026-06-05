@@ -23,7 +23,21 @@ Options:
                       Planar dissolve angle before collision decimation. Default: 5.
   --flatten-collision Flatten the hidden low-poly collision reference into the final
                       room USD. Use with --lowpoly-collision to produce two self-contained USDs.
-  --embed-environment Add room environment lights and a preview camera into the final USD.
+  --filter-low-collision-surfaces
+                      Remove broad near-horizontal collision faces slightly above
+                      the floor before attaching the hidden low-poly collision mesh.
+                      Enabled by default with --lowpoly-collision.
+  --no-filter-low-collision-surfaces
+                      Disable low collision surface filtering.
+  --low-collision-z-range MIN MAX
+                      Z range for filtered low surfaces. Default: 0.04 0.20.
+  --low-collision-min-area AREA
+                      Minimum face area for low-surface filtering. Default: 0.04.
+  --low-collision-min-xy-span SPAN
+                      Minimum X/Y span for low-surface filtering. Default: 0.60.
+  --low-collision-max-slope-deg DEG
+                      Maximum slope from horizontal for low-surface filtering. Default: 15.
+  --embed-environment Add room environment lights into the final USD.
   --lit-textures      Keep OR room textures as regular lit PBR materials.
                       Default: patch textures to emissive/unlit so the room displays texture color directly.
 
@@ -44,7 +58,9 @@ OR_MODEL_DIR="${PROJECT_ROOT}/assets/objects/OR/Model"
 BAKE_SCRIPT="${SCRIPT_DIR}/bake_or_scene_blender.py"
 CONVERT_SCRIPT="${SCRIPT_DIR}/convert_obj_to_usd.sh"
 ATTACH_COLLISION_SCRIPT="${SCRIPT_DIR}/attach_lowpoly_collision_usd.py"
+FILTER_COLLISION_SCRIPT="${SCRIPT_DIR}/filter_low_collision_surfaces_usd.py"
 CONFIGURE_ENV_SCRIPT="${SCRIPT_DIR}/configure_or_room_environment_usd.py"
+IMPORT_BLEND_CAMERAS_SCRIPT="${SCRIPT_DIR}/import_blender_cameras_to_or_usd.py"
 ISAACLAB_PATH="${ISAACLAB_PATH:-/home/sicheng/IsaacLab}"
 ISAACLAB_SH="${ISAACLAB_PATH}/isaaclab.sh"
 
@@ -68,6 +84,12 @@ lowpoly_collision=false
 collision_target_faces="25000"
 collision_planar_angle_deg="5"
 flatten_collision=false
+filter_low_collision_surfaces=true
+low_collision_min_z="0.04"
+low_collision_max_z="0.20"
+low_collision_min_area="0.04"
+low_collision_min_xy_span="0.60"
+low_collision_max_slope_deg="15"
 embed_environment=false
 unlit_textures=true
 blender_exe="${BLENDER_EXE:-}"
@@ -143,6 +165,43 @@ while [[ $# -gt 0 ]]; do
             flatten_collision=true
             shift
             ;;
+        --filter-low-collision-surfaces)
+            filter_low_collision_surfaces=true
+            shift
+            ;;
+        --no-filter-low-collision-surfaces)
+            filter_low_collision_surfaces=false
+            shift
+            ;;
+        --low-collision-z-range)
+            low_collision_min_z="$2"
+            low_collision_max_z="$3"
+            shift 3
+            ;;
+        --low-collision-min-area)
+            low_collision_min_area="$2"
+            shift 2
+            ;;
+        --low-collision-min-area=*)
+            low_collision_min_area="${1#*=}"
+            shift
+            ;;
+        --low-collision-min-xy-span)
+            low_collision_min_xy_span="$2"
+            shift 2
+            ;;
+        --low-collision-min-xy-span=*)
+            low_collision_min_xy_span="${1#*=}"
+            shift
+            ;;
+        --low-collision-max-slope-deg)
+            low_collision_max_slope_deg="$2"
+            shift 2
+            ;;
+        --low-collision-max-slope-deg=*)
+            low_collision_max_slope_deg="${1#*=}"
+            shift
+            ;;
         --embed-environment)
             embed_environment=true
             shift
@@ -213,7 +272,7 @@ fi
 
 bake_and_convert() {
     local room="$1"
-    local scale output_dir output_obj output_usd collision_usd
+    local scale output_dir output_obj output_usd collision_usd blend_scene blend_source_root
     local rot=()
     local inputs=()
 
@@ -229,6 +288,8 @@ bake_and_convert() {
             output_obj="${output_dir}/halo_room_baked.obj"
             output_usd="${output_dir}/halo_room_baked.usd"
             collision_usd="${output_dir}/halo_room_collision_low.usd"
+            blend_scene="${PROJECT_ROOT}/assets/objects/OR/humanoid_demo.blend"
+            blend_source_root="halo_hole_fix_final_a"
             ;;
         pulm)
             scale="5.1"
@@ -241,6 +302,8 @@ bake_and_convert() {
             output_obj="${output_dir}/pulm_room_baked.obj"
             output_usd="${output_dir}/pulm_room_baked.usd"
             collision_usd="${output_dir}/pulm_room_collision_low.usd"
+            blend_scene="${PROJECT_ROOT}/assets/objects/OR/pulm_room_SFV1.blend"
+            blend_source_root="pulm_room"
             ;;
         *)
             echo "Unknown room: ${room}" >&2
@@ -278,6 +341,17 @@ bake_and_convert() {
                 --collision-approx triangle-mesh \
                 "${converter_args[@]}"
 
+            if [[ "${filter_low_collision_surfaces}" == true ]]; then
+                echo "Filtering ${room} low, broad collision surfaces..."
+                TERM=xterm-256color "${ISAACLAB_SH}" -p "${FILTER_COLLISION_SCRIPT}" \
+                    "${collision_usd}" \
+                    --min-z "${low_collision_min_z}" \
+                    --max-z "${low_collision_max_z}" \
+                    --min-area "${low_collision_min_area}" \
+                    --min-xy-span "${low_collision_min_xy_span}" \
+                    --max-slope-deg "${low_collision_max_slope_deg}"
+            fi
+
             echo "Attaching ${room} hidden low-poly collision to final USD..."
             local attach_args=()
             if [[ "${flatten_collision}" == true ]]; then
@@ -296,8 +370,17 @@ bake_and_convert() {
         fi
 
         if [[ "${embed_environment}" == true ]]; then
-            echo "Embedding ${room} OR room lights and preview camera into final USD..."
+            echo "Embedding ${room} OR room lights into final USD..."
             TERM=xterm-256color "${ISAACLAB_SH}" -p "${CONFIGURE_ENV_SCRIPT}" "${output_usd}"
+
+            echo "Importing ${room} Blender cameras into final USD..."
+            "${blender_exe}" --background "${blend_scene}" --python "${IMPORT_BLEND_CAMERAS_SCRIPT}" -- \
+                "${output_usd}" "${inputs[@]}" \
+                --scale "${scale}" \
+                --rot-quat "${rot[@]}" \
+                --floor-to-z "${floor_to_z}" \
+                --origin-mode "${origin_mode}" \
+                --source-root-object "${blend_source_root}"
         fi
     fi
 }
